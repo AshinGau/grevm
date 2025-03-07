@@ -1,4 +1,5 @@
 use ahash::AHashSet as HashSet;
+use dashmap::DashSet;
 use std::{
     cell::UnsafeCell,
     cmp::min,
@@ -239,5 +240,109 @@ impl OrderedSet {
         let first = self.min_index;
         self.remove(first);
         Some(first)
+    }
+}
+
+#[derive(Debug)]
+pub struct ContinuousDetectSet {
+    num_index: usize,
+    detect_idx: DashSet<usize>,
+    continuous_idx: AtomicUsize,
+}
+
+impl ContinuousDetectSet {
+    pub fn new(num_index: usize) -> Self {
+        Self { num_index, detect_idx: DashSet::new(), continuous_idx: AtomicUsize::new(0) }
+    }
+
+    pub fn add(&self, index: usize) -> bool {
+        let mut updated = false;
+        if self.detect_idx.insert(index) {
+            let mut continuous = self.continuous_idx.load(Ordering::Acquire);
+            while self.detect_idx.contains(&continuous) {
+                if self
+                    .continuous_idx
+                    .compare_exchange(
+                        continuous,
+                        continuous + 1,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    updated = true;
+                }
+                continuous = self.continuous_idx.load(Ordering::Acquire);
+            }
+        }
+        updated
+    }
+
+    pub fn reset(&self, index: usize) {
+        let prev = self.continuous_idx.fetch_min(index, Ordering::Acquire);
+        if prev > index {
+            self.detect_idx.clear();
+        }
+    }
+
+    pub fn continuous_idx(&self) -> usize {
+        self.continuous_idx.load(Ordering::Acquire)
+    }
+}
+
+pub struct FinalityDetectSet {
+    num_txs: usize,
+    unconfirmed_txs: DashSet<usize>,
+    finality_idx: AtomicUsize,
+    validating_set: ContinuousDetectSet,
+}
+
+impl FinalityDetectSet {
+    pub fn new(num_txs: usize) -> Self {
+        Self {
+            num_txs,
+            unconfirmed_txs: DashSet::new(),
+            finality_idx: AtomicUsize::new(0),
+            validating_set: ContinuousDetectSet::new(num_txs),
+        }
+    }
+
+    pub fn unconfirmed(&self, index: usize) -> bool {
+        let mut updated = false;
+        if self.unconfirmed_txs.insert(index) {
+            let mut finality_idx = self.finality_idx.load(Ordering::Acquire);
+            while finality_idx < self.validating_set.continuous_idx() &&
+                self.unconfirmed_txs.contains(&finality_idx)
+            {
+                if self
+                    .finality_idx
+                    .compare_exchange(
+                        finality_idx,
+                        finality_idx + 1,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    updated = true;
+                }
+                finality_idx = self.finality_idx.load(Ordering::Acquire);
+            }
+        }
+        updated
+    }
+
+    pub fn validating(&self, index: usize) {
+        self.unconfirmed_txs.remove(&index);
+        self.validating_set.add(index);
+    }
+
+    pub fn reset(&self, index: usize) {
+        assert!(index >= self.finality_idx.load(Ordering::Acquire));
+        self.validating_set.reset(index);
+    }
+
+    pub fn finality_idx(&self) -> usize {
+        self.finality_idx.load(Ordering::Acquire)
     }
 }

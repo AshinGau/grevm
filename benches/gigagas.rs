@@ -61,9 +61,6 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     let mut iter_loop = 0;
     let report_metrics = rand::thread_rng().gen_range(0..10);
     let with_hints = std::env::var("WITH_HINTS").map_or(false, |s| s.parse().unwrap());
-    if std::env::var("ASYNC_COMMIT_STATE").is_err() {
-        std::env::set_var("ASYNC_COMMIT_STATE", "false");
-    }
     group.bench_function("Grevm Parallel", |b| {
         b.iter(|| {
             let recorder = DebuggingRecorder::new();
