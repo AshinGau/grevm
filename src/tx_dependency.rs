@@ -55,42 +55,19 @@ impl TxDependency {
         }
     }
 
-    pub fn next(&self, finality_idx: TxId) -> Vec<TxId> {
-        let mut txs = vec![];
+    pub fn next(&self) -> Option<TxId> {
         while self.index.load(Ordering::Relaxed) < self.num_txs {
             let index = self.index.fetch_add(1, Ordering::Relaxed);
             if index < self.num_txs {
                 let mut state = self.dependent_state[index].lock();
                 if state.onboard && state.dependency.is_none() {
-                    txs.push(index);
                     state.onboard = false;
                     self.num_onboard.fetch_sub(1, Ordering::Relaxed);
-                    if index == finality_idx {
-                        let mut continuous = index;
-                        while continuous < self.num_txs - 1 {
-                            let next = continuous + 1;
-                            let mut affects = self.affect_txs[continuous].lock();
-                            let mut dep = self.dependent_state[next].lock();
-                            if affects.contains(&next) &&
-                                dep.dependency == Some(continuous) &&
-                                dep.onboard
-                            {
-                                txs.push(next);
-                                affects.remove(&next);
-                                dep.dependency = None;
-                                dep.onboard = false;
-                                self.num_onboard.fetch_sub(1, Ordering::Relaxed);
-                                continuous += 1;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                    break;
+                    return Some(index)
                 }
             }
         }
-        txs
+        None
     }
 
     fn remove(&self, txid: TxId, distance: usize) {
@@ -137,29 +114,30 @@ impl TxDependency {
             let mut dep = self.affect_txs[dep_id].lock();
             let mut dep_state = self.dependent_state[dep_id].lock();
             let mut state = self.dependent_state[txid].lock();
-            assert!(!state.onboard && state.dependency.is_none());
             state.dependency = Some(dep_id);
-            state.onboard = true;
             state.dynamic = true;
-            self.num_onboard.fetch_add(1, Ordering::Relaxed);
+            if !state.onboard {
+                state.onboard = true;
+                self.num_onboard.fetch_add(1, Ordering::Relaxed);
+            }
 
-            if dep.insert(txid) {
-                if !dep_state.onboard {
-                    dep_state.onboard = true;
-                    self.num_onboard.fetch_add(1, Ordering::Relaxed);
-                }
-                if dep_state.dependency.is_none() {
-                    self.index.fetch_min(dep_id, Ordering::Relaxed);
-                }
-            } else {
-                assert!(dep_state.onboard);
+            dep.insert(txid);
+            if !dep_state.onboard {
+                dep_state.onboard = true;
+                self.num_onboard.fetch_add(1, Ordering::Relaxed);
+            }
+            if dep_state.dependency.is_none() {
+                self.index.fetch_min(dep_id, Ordering::Relaxed);
             }
         } else {
             let mut state = self.dependent_state[txid].lock();
-            assert!(!state.onboard && state.dependency.is_none());
-            state.onboard = true;
-            self.index.fetch_min(txid, Ordering::Relaxed);
-            self.num_onboard.fetch_add(1, Ordering::Relaxed);
+            if !state.onboard {
+                state.onboard = true;
+                self.index.fetch_min(txid, Ordering::Relaxed);
+            }
+            if state.dependency.is_none() {
+                self.num_onboard.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
