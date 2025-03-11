@@ -338,8 +338,9 @@ impl FinalityDetectSet {
     }
 
     pub fn reset(&self, index: usize) {
-        assert!(index >= self.finality_idx.load(Ordering::Acquire));
-        self.validating_set.reset(index);
+        if index >= self.finality_idx.load(Ordering::Acquire) {
+            self.validating_set.reset(index);
+        }
     }
 
     pub fn finality_idx(&self) -> usize {

@@ -132,7 +132,7 @@ struct SchedulerContext {
     validation_idx: AtomicUsize,
     commit_idx: AtomicUsize,
 
-    validation_set: ContinuousDetectSet,
+    executed_set: ContinuousDetectSet,
     finality_set: FinalityDetectSet,
 
     dependency_distance: metrics::Histogram,
@@ -145,7 +145,7 @@ impl SchedulerContext {
             num_txs,
             validation_idx: AtomicUsize::new(0),
             commit_idx: AtomicUsize::new(0),
-            validation_set: ContinuousDetectSet::new(num_txs),
+            executed_set: ContinuousDetectSet::new(num_txs),
             finality_set: FinalityDetectSet::new(num_txs),
             dependency_distance: histogram!("grevm.dependency_distance"),
             notifier: (Mutex::new(false), Condvar::new()),
@@ -158,7 +158,7 @@ impl SchedulerContext {
     }
 
     fn executed(&self, index: usize) {
-        self.validation_set.add(index);
+        self.executed_set.add(index);
     }
 
     fn unconfirmed(&self, index: usize) -> bool {
@@ -192,9 +192,9 @@ impl SchedulerContext {
     }
 
     fn next_validation_idx(&self) -> Option<usize> {
-        if self.validation_idx.load(Ordering::Acquire) < self.validation_set.continuous_idx() {
+        if self.validation_idx.load(Ordering::Acquire) < self.executed_set.continuous_idx() {
             let validation_idx = self.validation_idx.fetch_add(1, Ordering::Release);
-            if validation_idx < self.validation_set.continuous_idx() {
+            if validation_idx < self.executed_set.continuous_idx() {
                 return Some(validation_idx);
             }
         }
@@ -273,6 +273,11 @@ where
             }
             while commit_idx < self.scheduler_ctx.finality_idx() {
                 let mut tx_state = self.tx_states[commit_idx].lock();
+                if tx_state.status != TransactionStatus::Unconfirmed {
+                    thread::yield_now();
+                    continue;
+                }
+                tx_state.status = TransactionStatus::Finality;
                 let tx_result = self.tx_results[commit_idx].lock();
                 let result = tx_result.as_ref().unwrap().execute_result.clone();
                 let Ok(result) = result else { panic!("Commit error tx: {}", commit_idx) };
@@ -282,7 +287,6 @@ where
                     return;
                 }
 
-                tx_state.status = TransactionStatus::Finality;
                 if tx_state.incarnation > 1 {
                     self.metrics.conflict_txs.fetch_add(1, Ordering::Relaxed);
                 }
@@ -375,7 +379,6 @@ where
                 });
             }
         });
-        self.scheduler_ctx.notify();
         {
             let mut commiter = commiter.lock();
             if let Err(e) = commiter.commit_result() {
@@ -552,7 +555,6 @@ where
 
         tx_state.status =
             if conflict { TransactionStatus::Conflict } else { TransactionStatus::Executed };
-        self.scheduler_ctx.executed(txid);
         if txid < self.scheduler_ctx.validation_idx() {
             if conflict {
                 self.scheduler_ctx.reset_validation_idx(txid + 1);
@@ -565,6 +567,7 @@ where
                 }
             }
         }
+        self.scheduler_ctx.executed(txid);
         None
     }
 
