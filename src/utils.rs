@@ -258,35 +258,35 @@ impl ContinuousDetectSet {
     pub fn add(&self, index: usize) -> bool {
         let mut updated = false;
         if self.detect_idx.insert(index) {
-            let mut continuous = self.continuous_idx.load(Ordering::Acquire);
+            let mut continuous = self.continuous_idx.load(Ordering::Relaxed);
             while self.detect_idx.contains(&continuous) {
                 if self
                     .continuous_idx
                     .compare_exchange(
                         continuous,
                         continuous + 1,
-                        Ordering::AcqRel,
+                        Ordering::Relaxed,
                         Ordering::Relaxed,
                     )
                     .is_ok()
                 {
                     updated = true;
                 }
-                continuous = self.continuous_idx.load(Ordering::Acquire);
+                continuous = self.continuous_idx.load(Ordering::Relaxed);
             }
         }
         updated
     }
 
     pub fn reset(&self, index: usize) {
-        let prev = self.continuous_idx.fetch_min(index, Ordering::Acquire);
+        let prev = self.continuous_idx.fetch_min(index, Ordering::Relaxed);
         if prev > index {
             self.detect_idx.clear();
         }
     }
 
     pub fn continuous_idx(&self) -> usize {
-        self.continuous_idx.load(Ordering::Acquire)
+        self.continuous_idx.load(Ordering::Relaxed)
     }
 }
 
@@ -310,7 +310,7 @@ impl FinalityDetectSet {
     pub fn unconfirmed(&self, index: usize) -> bool {
         let mut updated = false;
         if self.unconfirmed_txs.insert(index) {
-            let mut finality_idx = self.finality_idx.load(Ordering::Acquire);
+            let mut finality_idx = self.finality_idx.load(Ordering::Relaxed);
             while finality_idx < self.validating_set.continuous_idx() &&
                 self.unconfirmed_txs.contains(&finality_idx)
             {
@@ -319,14 +319,14 @@ impl FinalityDetectSet {
                     .compare_exchange(
                         finality_idx,
                         finality_idx + 1,
-                        Ordering::AcqRel,
+                        Ordering::Relaxed,
                         Ordering::Relaxed,
                     )
                     .is_ok()
                 {
                     updated = true;
                 }
-                finality_idx = self.finality_idx.load(Ordering::Acquire);
+                finality_idx = self.finality_idx.load(Ordering::Relaxed);
             }
         }
         updated
@@ -338,12 +338,12 @@ impl FinalityDetectSet {
     }
 
     pub fn reset(&self, index: usize) {
-        if index >= self.finality_idx.load(Ordering::Acquire) {
+        if index >= self.finality_idx.load(Ordering::Relaxed) {
             self.validating_set.reset(index);
         }
     }
 
     pub fn finality_idx(&self) -> usize {
-        self.finality_idx.load(Ordering::Acquire)
+        self.finality_idx.load(Ordering::Relaxed)
     }
 }

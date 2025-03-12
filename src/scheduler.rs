@@ -135,7 +135,7 @@ struct SchedulerContext {
     executed_set: ContinuousDetectSet,
     finality_set: FinalityDetectSet,
 
-    dependency_distance: metrics::Histogram,
+    reset_validation_idx_cnt: AtomicUsize,
     notifier: (Mutex<bool>, Condvar),
 }
 
@@ -147,14 +147,15 @@ impl SchedulerContext {
             commit_idx: AtomicUsize::new(0),
             executed_set: ContinuousDetectSet::new(num_txs),
             finality_set: FinalityDetectSet::new(num_txs),
-            dependency_distance: histogram!("grevm.dependency_distance"),
+            reset_validation_idx_cnt: AtomicUsize::new(0),
             notifier: (Mutex::new(false), Condvar::new()),
         }
     }
 
     fn reset_validation_idx(&self, index: usize) {
         self.finality_set.reset(index);
-        self.validation_idx.fetch_min(index, Ordering::Release);
+        self.validation_idx.fetch_min(index, Ordering::Relaxed);
+        self.reset_validation_idx_cnt.fetch_add(1, Ordering::Relaxed);
     }
 
     fn executed(&self, index: usize) {
@@ -188,12 +189,12 @@ impl SchedulerContext {
     }
 
     fn validation_idx(&self) -> usize {
-        self.validation_idx.load(Ordering::Acquire)
+        self.validation_idx.load(Ordering::Relaxed)
     }
 
     fn next_validation_idx(&self) -> Option<usize> {
-        if self.validation_idx.load(Ordering::Acquire) < self.executed_set.continuous_idx() {
-            let validation_idx = self.validation_idx.fetch_add(1, Ordering::Release);
+        if self.validation_idx.load(Ordering::Relaxed) < self.executed_set.continuous_idx() {
+            let validation_idx = self.validation_idx.fetch_add(1, Ordering::Relaxed);
             if validation_idx < self.num_txs {
                 return Some(validation_idx);
             }
@@ -264,6 +265,7 @@ where
         let mut start = Instant::now();
         let mut commit_idx = 0;
         let mut commiter = commiter.lock();
+        let dependency_distance = histogram!("grevm.dependency_distance");
         while !self.abort.load(Ordering::Relaxed) && commit_idx < self.block_size {
             if commit_idx == self.scheduler_ctx.finality_idx() {
                 let mut updated = self.scheduler_ctx.notifier.0.lock();
@@ -292,7 +294,7 @@ where
                     self.metrics.conflict_txs.fetch_add(1, Ordering::Relaxed);
                 }
                 if let Some(dep_id) = tx_state.dependency {
-                    self.scheduler_ctx.dependency_distance.record((commit_idx - dep_id) as f64);
+                    dependency_distance.record((commit_idx - dep_id) as f64);
                     if tx_state.incarnation == 1 {
                         self.metrics.one_attempt_with_dependency.fetch_add(1, Ordering::Relaxed);
                     } else if tx_state.incarnation > 2 {
@@ -388,6 +390,10 @@ where
             self.results.lock().extend(commiter.take_result());
         }
         self.post_execute()?;
+        self.metrics.reset_validation_idx_cnt.store(
+            self.scheduler_ctx.reset_validation_idx_cnt.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         self.metrics.report();
         Ok(())
     }
@@ -475,7 +481,7 @@ where
         let mut tx_env = self.txs[txid].clone();
         tx_env.nonce = None;
         *evm.tx_mut() = tx_env;
-        let commit_idx = self.scheduler_ctx.commit_idx.load(Ordering::Acquire);
+        let commit_idx = self.scheduler_ctx.commit_idx.load(Ordering::Relaxed);
         let result = evm.transact_lazy_reward();
 
         let mut write_new_locations = false;
@@ -700,10 +706,7 @@ where
 
             while let Some(execute_id) = self.tx_dependency.next() {
                 let mut tx = self.tx_states[execute_id].lock();
-                if !matches!(
-                        tx.status,
-                        TransactionStatus::Initial | TransactionStatus::Conflict
-                    ) {
+                if !matches!(tx.status, TransactionStatus::Initial | TransactionStatus::Conflict) {
                     if tx.status == TransactionStatus::Executed {
                         self.tx_dependency.remove_after_execution(execute_id);
                     } else if tx.status == TransactionStatus::Unconfirmed {
