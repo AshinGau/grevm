@@ -194,7 +194,7 @@ impl SchedulerContext {
     fn next_validation_idx(&self) -> Option<usize> {
         if self.validation_idx.load(Ordering::Acquire) < self.executed_set.continuous_idx() {
             let validation_idx = self.validation_idx.fetch_add(1, Ordering::Release);
-            if validation_idx < self.executed_set.continuous_idx() {
+            if validation_idx < self.num_txs {
                 return Some(validation_idx);
             }
         }
@@ -274,6 +274,7 @@ where
             while commit_idx < self.scheduler_ctx.finality_idx() {
                 let mut tx_state = self.tx_states[commit_idx].lock();
                 if tx_state.status != TransactionStatus::Unconfirmed {
+                    drop(tx_state);
                     thread::yield_now();
                     continue;
                 }
