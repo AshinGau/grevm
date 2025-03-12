@@ -3,7 +3,7 @@ use crate::{
     hint::ParallelExecutionHints,
     storage::CacheDB,
     tx_dependency::TxDependency,
-    utils::{ContinuousDetectSet, FinalityDetectSet, LockFreeQueue},
+    utils::{ContinuousDetectSet, LockFreeQueue},
     AbortReason, LocationAndType, MemoryEntry, ParallelState, ReadVersion, Task, TransactionResult,
     TransactionStatus, TxId, TxState, TxVersion, CONCURRENT_LEVEL,
 };
@@ -130,13 +130,10 @@ impl ExecuteMetricsCollector {
 struct SchedulerContext {
     num_txs: usize,
     validation_idx: AtomicUsize,
+    finality_idx: AtomicUsize,
     commit_idx: AtomicUsize,
-
     executed_set: ContinuousDetectSet,
-    finality_set: FinalityDetectSet,
-
     reset_validation_idx_cnt: AtomicUsize,
-    notifier: (Mutex<bool>, Condvar),
 }
 
 impl SchedulerContext {
@@ -144,48 +141,30 @@ impl SchedulerContext {
         Self {
             num_txs,
             validation_idx: AtomicUsize::new(0),
+            finality_idx: AtomicUsize::new(0),
             commit_idx: AtomicUsize::new(0),
             executed_set: ContinuousDetectSet::new(num_txs),
-            finality_set: FinalityDetectSet::new(num_txs),
             reset_validation_idx_cnt: AtomicUsize::new(0),
-            notifier: (Mutex::new(false), Condvar::new()),
         }
     }
 
     fn reset_validation_idx(&self, index: usize) {
-        self.finality_set.reset(index);
-        self.validation_idx.fetch_min(index, Ordering::Relaxed);
-        self.reset_validation_idx_cnt.fetch_add(1, Ordering::Relaxed);
+        let prev = self.validation_idx.fetch_min(index, Ordering::Relaxed);
+        if prev > index {
+            self.reset_validation_idx_cnt.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn executed(&self, index: usize) {
         self.executed_set.add(index);
     }
 
-    fn unconfirmed(&self, index: usize) -> bool {
-        if self.finality_set.unconfirmed(index) {
-            self.notify();
-            true
-        } else {
-            false
-        }
-    }
-
-    fn notify(&self) {
-        *self.notifier.0.lock() = true;
-        self.notifier.1.notify_one();
-    }
-
-    fn validating(&self, index: usize) {
-        self.finality_set.validating(index);
-    }
-
     fn finished(&self) -> bool {
-        self.finality_set.finality_idx() >= self.num_txs
+        self.finality_idx.load(Ordering::Relaxed) >= self.num_txs
     }
 
     fn finality_idx(&self) -> usize {
-        self.finality_set.finality_idx()
+        self.finality_idx.load(Ordering::Relaxed)
     }
 
     fn validation_idx(&self) -> usize {
@@ -267,20 +246,13 @@ where
         let mut commiter = commiter.lock();
         let dependency_distance = histogram!("grevm.dependency_distance");
         while !self.abort.load(Ordering::Relaxed) && commit_idx < self.block_size {
-            if commit_idx == self.scheduler_ctx.finality_idx() {
-                let mut updated = self.scheduler_ctx.notifier.0.lock();
-                if !*updated {
-                    self.scheduler_ctx.notifier.1.wait(&mut updated);
-                }
-            }
-            while commit_idx < self.scheduler_ctx.finality_idx() {
+            while commit_idx < self.block_size {
                 let mut tx_state = self.tx_states[commit_idx].lock();
                 if tx_state.status != TransactionStatus::Unconfirmed {
-                    drop(tx_state);
-                    thread::yield_now();
-                    continue;
+                    break;
                 }
                 tx_state.status = TransactionStatus::Finality;
+                self.scheduler_ctx.finality_idx.fetch_add(1, Ordering::Relaxed);
                 let tx_result = self.tx_results[commit_idx].lock();
                 let result = tx_result.as_ref().unwrap().execute_result.clone();
                 let Ok(result) = result else { panic!("Commit error tx: {}", commit_idx) };
@@ -307,14 +279,15 @@ where
                 commit_idx += 1;
                 self.scheduler_ctx.commit_idx.fetch_add(1, Ordering::Relaxed);
             }
-            *self.scheduler_ctx.notifier.0.lock() = false;
+            thread::yield_now();
 
             if (Instant::now() - start).as_millis() > 8_000 {
                 start = Instant::now();
                 println!(
-                    "stuck..., finality_idx: {}, validation_idx: {}",
+                    "stuck..., finality_idx: {}, validation_idx: {}, execution_idx: {}",
                     self.scheduler_ctx.finality_idx(),
                     self.scheduler_ctx.validation_idx(),
+                    self.scheduler_ctx.executed_set.continuous_idx(),
                 );
                 let status: Vec<(TxId, TransactionStatus)> =
                     self.tx_states.iter().map(|s| s.lock().status.clone()).enumerate().collect();
@@ -599,7 +572,6 @@ where
         // check the read version of read set
         let mut conflict = false;
         let mut dependency: Option<TxId> = None;
-        self.scheduler_ctx.validating(txid);
         for (location, version) in result.read_set.iter() {
             if let Some(written_transactions) = self.mv_memory.get(location) {
                 if let Some((&previous_id, latest_version)) =
@@ -638,7 +610,6 @@ where
             }
             TransactionStatus::Conflict
         } else {
-            self.scheduler_ctx.unconfirmed(txid);
             TransactionStatus::Unconfirmed
         };
         tx_state.dependency = dependency;

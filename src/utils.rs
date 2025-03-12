@@ -1,5 +1,4 @@
 use ahash::AHashSet as HashSet;
-use dashmap::DashSet;
 use std::{
     cell::UnsafeCell,
     cmp::min,
@@ -245,105 +244,46 @@ impl OrderedSet {
 
 #[derive(Debug)]
 pub struct ContinuousDetectSet {
-    num_index: usize,
-    detect_idx: DashSet<usize>,
+    num_flag: usize,
+    index_flag: Vec<bool>,
+    num_index: AtomicUsize,
     continuous_idx: AtomicUsize,
 }
 
 impl ContinuousDetectSet {
-    pub fn new(num_index: usize) -> Self {
-        Self { num_index, detect_idx: DashSet::new(), continuous_idx: AtomicUsize::new(0) }
-    }
-
-    pub fn add(&self, index: usize) -> bool {
-        let mut updated = false;
-        if self.detect_idx.insert(index) {
-            let mut continuous = self.continuous_idx.load(Ordering::Relaxed);
-            while self.detect_idx.contains(&continuous) {
-                if self
-                    .continuous_idx
-                    .compare_exchange(
-                        continuous,
-                        continuous + 1,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    updated = true;
-                }
-                continuous = self.continuous_idx.load(Ordering::Relaxed);
-            }
+    pub fn new(num_flag: usize) -> Self {
+        Self {
+            num_flag,
+            index_flag: vec![false; num_flag],
+            num_index: AtomicUsize::new(0),
+            continuous_idx: AtomicUsize::new(0),
         }
-        updated
     }
 
-    pub fn reset(&self, index: usize) {
-        let prev = self.continuous_idx.fetch_min(index, Ordering::Relaxed);
-        if prev > index {
-            self.detect_idx.clear();
+    fn check_continuous(&self) {
+        let mut continuous_idx = self.continuous_idx.load(Ordering::Relaxed);
+        while continuous_idx < self.num_flag && self.index_flag[continuous_idx] {
+            if self.continuous_idx.compare_exchange(continuous_idx, continuous_idx + 1, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+                break;
+            }
+            continuous_idx = self.continuous_idx.load(Ordering::Relaxed);
+        }
+    }
+
+    pub fn add(&self, index: usize) {
+        if !self.index_flag[index] {
+            #[allow(invalid_reference_casting)]
+            let index_flag = unsafe { &mut *(&self.index_flag as *const Vec<bool> as *mut Vec<bool>) };
+            index_flag[index] = true;
+            self.num_index.fetch_add(1, Ordering::Relaxed);
+            self.check_continuous();
         }
     }
 
     pub fn continuous_idx(&self) -> usize {
+        if self.num_index.load(Ordering::Relaxed) >= self.num_flag && self.continuous_idx.load(Ordering::Relaxed) < self.num_flag {
+            self.check_continuous();
+        }
         self.continuous_idx.load(Ordering::Relaxed)
-    }
-}
-
-pub struct FinalityDetectSet {
-    num_txs: usize,
-    unconfirmed_txs: DashSet<usize>,
-    finality_idx: AtomicUsize,
-    validating_set: ContinuousDetectSet,
-}
-
-impl FinalityDetectSet {
-    pub fn new(num_txs: usize) -> Self {
-        Self {
-            num_txs,
-            unconfirmed_txs: DashSet::new(),
-            finality_idx: AtomicUsize::new(0),
-            validating_set: ContinuousDetectSet::new(num_txs),
-        }
-    }
-
-    pub fn unconfirmed(&self, index: usize) -> bool {
-        let mut updated = false;
-        if self.unconfirmed_txs.insert(index) {
-            let mut finality_idx = self.finality_idx.load(Ordering::Relaxed);
-            while finality_idx < self.validating_set.continuous_idx() &&
-                self.unconfirmed_txs.contains(&finality_idx)
-            {
-                if self
-                    .finality_idx
-                    .compare_exchange(
-                        finality_idx,
-                        finality_idx + 1,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    updated = true;
-                }
-                finality_idx = self.finality_idx.load(Ordering::Relaxed);
-            }
-        }
-        updated
-    }
-
-    pub fn validating(&self, index: usize) {
-        self.unconfirmed_txs.remove(&index);
-        self.validating_set.add(index);
-    }
-
-    pub fn reset(&self, index: usize) {
-        if index >= self.finality_idx.load(Ordering::Relaxed) {
-            self.validating_set.reset(index);
-        }
-    }
-
-    pub fn finality_idx(&self) -> usize {
-        self.finality_idx.load(Ordering::Relaxed)
     }
 }
