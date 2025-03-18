@@ -135,7 +135,10 @@ struct SchedulerContext {
     commit_idx: AtomicUsize,
     executed_set: ContinuousDetectSet,
     reset_validation_idx_cnt: AtomicUsize,
-    validation_lock: RwLock<()>,
+
+    logical_ts: AtomicUsize,
+    lower_ts: Vec<AtomicUsize>,
+    unconfirmed_ts: Vec<AtomicUsize>,
 }
 
 impl SchedulerContext {
@@ -147,12 +150,16 @@ impl SchedulerContext {
             commit_idx: AtomicUsize::new(0),
             executed_set: ContinuousDetectSet::new(num_txs),
             reset_validation_idx_cnt: AtomicUsize::new(0),
-            validation_lock: RwLock::new(()),
+            logical_ts: AtomicUsize::new(1),
+            lower_ts: (0..num_txs).map(|_| AtomicUsize::new(0)).collect(),
+            unconfirmed_ts: (0..num_txs).map(|_| AtomicUsize::new(0)).collect(),
         }
     }
 
     fn reset_validation_idx(&self, index: usize) {
         if index < self.num_txs {
+            let ts = self.logical_ts.fetch_add(1, Ordering::Relaxed);
+            self.lower_ts[index].fetch_max(ts, Ordering::Release);
             let prev = self.validation_idx.fetch_min(index, Ordering::Relaxed);
             if prev > index {
                 self.reset_validation_idx_cnt.fetch_add(1, Ordering::Relaxed);
@@ -160,8 +167,16 @@ impl SchedulerContext {
         }
     }
 
+    fn logical_timestamp(&self) -> usize {
+        self.logical_ts.fetch_add(1, Ordering::Relaxed)
+    }
+
     fn executed(&self, index: usize) {
         self.executed_set.add(index);
+    }
+
+    fn unconfirmed(&self, index: usize, ts: usize) {
+        self.unconfirmed_ts[index].fetch_max(ts, Ordering::Release);
     }
 
     fn finished(&self) -> bool {
@@ -174,10 +189,6 @@ impl SchedulerContext {
 
     fn validation_idx(&self) -> usize {
         self.validation_idx.load(Ordering::Relaxed)
-    }
-
-    fn should_validate(&self) -> bool {
-        self.validation_idx.load(Ordering::Relaxed) < self.executed_set.continuous_idx()
     }
 
     fn next_validation_idx(&self) -> Option<usize> {
@@ -252,6 +263,7 @@ where
     fn async_commit(&self, commiter: &Mutex<StateAsyncCommit<DB>>) {
         let mut start = Instant::now();
         let mut commit_idx = 0;
+        let mut lower_ts = 0;
         let mut commiter = commiter.lock();
         let async_commit_state =
             std::env::var("ASYNC_COMMIT_STATE").map_or(true, |s| s.parse().unwrap());
@@ -261,11 +273,11 @@ where
                 if self.tx_states[commit_idx].lock().status != TransactionStatus::Unconfirmed {
                     break;
                 }
+                lower_ts =
+                    max(lower_ts, self.scheduler_ctx.lower_ts[commit_idx].load(Ordering::Acquire));
+                if self.scheduler_ctx.unconfirmed_ts[commit_idx].load(Ordering::Acquire) <= lower_ts
                 {
-                    let _lock = self.scheduler_ctx.validation_lock.write();
-                    if commit_idx >= self.scheduler_ctx.validation_idx() {
-                        break;
-                    }
+                    break;
                 }
                 let mut tx_state = self.tx_states[commit_idx].lock();
                 tx_state.status = TransactionStatus::Finality;
@@ -590,6 +602,7 @@ where
             panic!("Error transaction should take as conflict before validating");
         }
 
+        let ts = self.scheduler_ctx.logical_timestamp();
         // check the read version of read set
         let mut conflict = false;
         let mut dependency: Option<TxId> = None;
@@ -631,6 +644,7 @@ where
             }
             TransactionStatus::Conflict
         } else {
+            self.scheduler_ctx.unconfirmed(txid, ts);
             TransactionStatus::Unconfirmed
         };
         tx_state.dependency = dependency;
@@ -685,20 +699,17 @@ where
 
     pub fn next(&self) -> Option<Task> {
         while !self.scheduler_ctx.finished() && !self.abort.load(Ordering::Relaxed) {
-            if self.scheduler_ctx.should_validate() {
-                let _lock = self.scheduler_ctx.validation_lock.read();
-                while let Some(validation_idx) = self.scheduler_ctx.next_validation_idx() {
-                    let mut tx = self.tx_states[validation_idx].lock();
-                    match tx.status {
-                        TransactionStatus::Executed | TransactionStatus::Unconfirmed => {
-                            tx.status = TransactionStatus::Validating;
-                            return Some(Task::Validation(TxVersion::new(
-                                validation_idx,
-                                tx.incarnation,
-                            )));
-                        }
-                        _ => {}
+            while let Some(validation_idx) = self.scheduler_ctx.next_validation_idx() {
+                let mut tx = self.tx_states[validation_idx].lock();
+                match tx.status {
+                    TransactionStatus::Executed | TransactionStatus::Unconfirmed => {
+                        tx.status = TransactionStatus::Validating;
+                        return Some(Task::Validation(TxVersion::new(
+                            validation_idx,
+                            tx.incarnation,
+                        )));
                     }
+                    _ => {}
                 }
             }
 
