@@ -367,23 +367,14 @@ where
                         .with_spec_id(self.spec_id.clone())
                         .with_env(Box::new(self.env.clone()))
                         .build();
-                    while let Some(task) = self.next() {
-                        match task {
-                            Task::Execution(tx_version) => {
-                                if let Some(validation_task) = self.execute(&mut evm, tx_version) {
-                                    if let Task::Validation(tx_version) = validation_task {
-                                        self.validate(tx_version);
-                                    } else {
-                                        panic!("Only submit validation task after execution");
-                                    }
-                                }
-                            }
-                            Task::Validation(tx_version) => {
-                                self.validate(tx_version);
-                            }
-                            Task::ExecutionGroup(tx_versions) => {
-                                self.execute_group(&mut evm, tx_versions);
-                            }
+                    let mut task = self.next();
+                    while task.is_some() {
+                        task = match task.unwrap() {
+                            Task::Execution(tx_version) => self.execute(&mut evm, tx_version),
+                            Task::Validation(tx_version) => self.validate(tx_version),
+                        };
+                        if task.is_none() && !self.abort.load(Ordering::Relaxed) {
+                            task = self.next();
                         }
                     }
                 });
@@ -459,16 +450,6 @@ where
     fn abort(&self, abort_reason: AbortReason) {
         self.abort_reason.get_or_init(|| abort_reason);
         self.abort.store(true, Ordering::Relaxed);
-    }
-
-    fn execute_group(
-        &self,
-        evm: &mut Evm<'_, (), &mut CacheDB<ParallelState<DB>>>,
-        tx_versions: Vec<TxVersion>,
-    ) {
-        for tx_version in tx_versions {
-            self.execute(evm, tx_version);
-        }
     }
 
     fn execute(
@@ -587,12 +568,12 @@ where
         None
     }
 
-    fn validate(&self, tx_version: TxVersion) {
+    fn validate(&self, tx_version: TxVersion) -> Option<Task> {
         let TxVersion { txid, incarnation } = tx_version;
         let mut tx_state = self.tx_states[txid].lock();
         let tx_result = self.tx_results[txid].lock();
         if tx_state.status != TransactionStatus::Validating {
-            return;
+            return None;
         }
         if tx_state.incarnation != incarnation {
             panic!("Inconsistent incarnation when validating");
@@ -653,16 +634,26 @@ where
         tx_state.dependency = dependency;
 
         if conflict {
-            // update dependency
-            let dep_tx = dependency.and_then(|dep| {
-                if dep >= self.scheduler_ctx.finality_idx() {
-                    Some(dep)
-                } else {
-                    None
-                }
-            });
-            self.tx_dependency.add(txid, dep_tx);
+            if dependency.clone().map(|dep_id| self.dependent_ready(dep_id)).unwrap_or(true) {
+                tx_state.incarnation += 1;
+                tx_state.status = TransactionStatus::Executing;
+                return Some(Task::Execution(TxVersion::new(txid, tx_state.incarnation)));
+            } else {
+                // update dependency
+                self.tx_dependency.add(txid, dependency);
+            }
         }
+        None
+    }
+
+    fn dependent_ready(&self, dep_id: TxId) -> bool {
+        let dep = self.tx_states[dep_id].lock();
+        matches!(
+            dep.status,
+            TransactionStatus::Executed |
+                TransactionStatus::Unconfirmed |
+                TransactionStatus::Finality
+        )
     }
 
     fn mark_estimate(&self, txid: TxId, write_set: &HashSet<LocationAndType>) {
