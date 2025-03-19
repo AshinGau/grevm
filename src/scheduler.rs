@@ -191,8 +191,17 @@ impl SchedulerContext {
         self.validation_idx.load(Ordering::Relaxed)
     }
 
-    fn next_validation_idx(&self) -> Option<usize> {
-        if self.validation_idx.load(Ordering::Relaxed) < self.executed_set.continuous_idx() {
+    fn should_shedule(&self, executing_idx: usize) -> bool {
+        let validation_idx = self.validation_idx.load(Ordering::Relaxed);
+        let should_validation =
+            validation_idx < executing_idx && validation_idx < self.executed_set.continuous_idx();
+        let should_execution = executing_idx < self.num_txs;
+        should_validation || should_execution
+    }
+
+    fn next_validation_idx(&self, executing_idx: usize) -> Option<usize> {
+        let validation_idx = self.validation_idx.load(Ordering::Relaxed);
+        if validation_idx < executing_idx && validation_idx < self.executed_set.continuous_idx() {
             let validation_idx = self.validation_idx.fetch_add(1, Ordering::Relaxed);
             if validation_idx < self.num_txs {
                 return Some(validation_idx);
@@ -634,26 +643,17 @@ where
         tx_state.dependency = dependency;
 
         if conflict {
-            if dependency.clone().map(|dep_id| self.dependent_ready(dep_id)).unwrap_or(true) {
-                tx_state.incarnation += 1;
-                tx_state.status = TransactionStatus::Executing;
-                return Some(Task::Execution(TxVersion::new(txid, tx_state.incarnation)));
-            } else {
-                // update dependency
-                self.tx_dependency.add(txid, dependency);
-            }
+            // update dependency
+            let dep_tx = dependency.and_then(|dep| {
+                if dep >= self.scheduler_ctx.finality_idx() {
+                    Some(dep)
+                } else {
+                    None
+                }
+            });
+            self.tx_dependency.add(txid, dep_tx);
         }
         None
-    }
-
-    fn dependent_ready(&self, dep_id: TxId) -> bool {
-        let dep = self.tx_states[dep_id].lock();
-        matches!(
-            dep.status,
-            TransactionStatus::Executed |
-                TransactionStatus::Unconfirmed |
-                TransactionStatus::Finality
-        )
     }
 
     fn mark_estimate(&self, txid: TxId, write_set: &HashSet<LocationAndType>) {
@@ -693,7 +693,13 @@ where
 
     pub fn next(&self) -> Option<Task> {
         while !self.scheduler_ctx.finished() && !self.abort.load(Ordering::Relaxed) {
-            while let Some(validation_idx) = self.scheduler_ctx.next_validation_idx() {
+            if !self.scheduler_ctx.should_shedule(self.tx_dependency.index()) {
+                thread::yield_now();
+            }
+
+            if let Some(validation_idx) =
+                self.scheduler_ctx.next_validation_idx(self.tx_dependency.index())
+            {
                 let mut tx = self.tx_states[validation_idx].lock();
                 match tx.status {
                     TransactionStatus::Executed | TransactionStatus::Unconfirmed => {
@@ -707,19 +713,17 @@ where
                 }
             }
 
-            while let Some(execute_id) = self.tx_dependency.next() {
+            if let Some(execute_id) = self.tx_dependency.next() {
                 let mut tx = self.tx_states[execute_id].lock();
-                if !matches!(tx.status, TransactionStatus::Initial | TransactionStatus::Conflict) {
+                if matches!(tx.status, TransactionStatus::Initial | TransactionStatus::Conflict) {
+                    tx.status = TransactionStatus::Executing;
+                    tx.incarnation += 1;
+                    return Some(Task::Execution(TxVersion::new(execute_id, tx.incarnation)));
+                } else {
                     self.tx_dependency.remove(execute_id);
                     self.metrics.useless_dependent_update.fetch_add(1, Ordering::Relaxed);
-                    continue;
                 }
-                tx.status = TransactionStatus::Executing;
-                tx.incarnation += 1;
-                return Some(Task::Execution(TxVersion::new(execute_id, tx.incarnation)));
             }
-
-            thread::yield_now();
         }
         None
     }

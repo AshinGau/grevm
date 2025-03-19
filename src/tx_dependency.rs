@@ -50,7 +50,7 @@ impl TxDependency {
     }
 
     pub fn next(&self) -> Option<TxId> {
-        while self.index.load(Ordering::Relaxed) < self.num_txs {
+        if self.index.load(Ordering::Relaxed) < self.num_txs {
             let index = self.index.fetch_add(1, Ordering::Relaxed);
             if index < self.num_txs {
                 let mut state = self.dependent_state[index].lock();
@@ -62,6 +62,10 @@ impl TxDependency {
             }
         }
         None
+    }
+
+    pub fn index(&self) -> usize {
+        self.index.load(Ordering::Relaxed)
     }
 
     pub(crate) fn remove(&self, txid: TxId) {
