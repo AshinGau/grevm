@@ -344,7 +344,10 @@ where
         concurrency_level: Option<usize>,
     ) -> Result<(), GrevmError<DB::Error>> {
         self.metrics.total_tx_cnt.store(self.block_size, Ordering::Relaxed);
-        let concurrency_level = concurrency_level.unwrap_or(*CONCURRENT_LEVEL);
+        let concurrency_level = concurrency_level.unwrap_or(
+            std::env::var("GREVM_CONCURRENT_LEVEL")
+                .map_or(*CONCURRENT_LEVEL, |s| s.parse().unwrap()),
+        );
         let commiter = Mutex::new(StateAsyncCommit::new(self.env.block.coinbase, &self.state));
         commiter.lock().init().map_err(|e| GrevmError { txid: 0, error: EVMError::Database(e) })?;
         thread::scope(|scope| {
