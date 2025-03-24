@@ -485,6 +485,7 @@ where
 
         let mut write_new_locations = false;
         let mut conflict = false;
+        let mut next = None;
         match result {
             Ok(result_and_state) => {
                 // only the miner involved in transaction should accumulate the rewards of finality
@@ -527,7 +528,7 @@ where
                         self.tx_dependency.add(txid, self.generate_dependent_tx(txid, &read_set));
                     }
                 } else {
-                    self.tx_dependency.remove(txid);
+                    next = self.tx_dependency.remove(txid, true);
                 }
                 *last_result = Some(TransactionResult {
                     read_set,
@@ -561,6 +562,15 @@ where
 
         tx_state.status =
             if conflict { TransactionStatus::Conflict } else { TransactionStatus::Executed };
+        self.scheduler_ctx.executed(txid);
+
+        if let Some(next) = next {
+            if txid < self.scheduler_ctx.validation_idx() {
+                self.scheduler_ctx.reset_validation_idx(txid);
+            }
+            drop(tx_state);
+            return self.execution_task(next);
+        }
         if txid < self.scheduler_ctx.validation_idx() {
             if conflict {
                 self.scheduler_ctx.reset_validation_idx(txid + 1);
@@ -573,7 +583,6 @@ where
                 }
             }
         }
-        self.scheduler_ctx.executed(txid);
         None
     }
 
@@ -691,6 +700,19 @@ where
         max_dep_id
     }
 
+    fn execution_task(&self, execute_id: TxId) -> Option<Task> {
+        let mut tx = self.tx_states[execute_id].lock();
+        if matches!(tx.status, TransactionStatus::Initial | TransactionStatus::Conflict) {
+            tx.status = TransactionStatus::Executing;
+            tx.incarnation += 1;
+            Some(Task::Execution(TxVersion::new(execute_id, tx.incarnation)))
+        } else {
+            self.tx_dependency.remove(execute_id, false);
+            self.metrics.useless_dependent_update.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+
     pub fn next(&self) -> Option<Task> {
         while !self.scheduler_ctx.finished() && !self.abort.load(Ordering::Relaxed) {
             if !self.scheduler_ctx.should_shedule(self.tx_dependency.index()) {
@@ -714,14 +736,8 @@ where
             }
 
             if let Some(execute_id) = self.tx_dependency.next() {
-                let mut tx = self.tx_states[execute_id].lock();
-                if matches!(tx.status, TransactionStatus::Initial | TransactionStatus::Conflict) {
-                    tx.status = TransactionStatus::Executing;
-                    tx.incarnation += 1;
-                    return Some(Task::Execution(TxVersion::new(execute_id, tx.incarnation)));
-                } else {
-                    self.tx_dependency.remove(execute_id);
-                    self.metrics.useless_dependent_update.fetch_add(1, Ordering::Relaxed);
+                if let Some(task) = self.execution_task(execute_id) {
+                    return Some(task);
                 }
             }
         }

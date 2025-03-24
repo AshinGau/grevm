@@ -68,21 +68,29 @@ impl TxDependency {
         self.index.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn remove(&self, txid: TxId) {
+    pub(crate) fn remove(&self, txid: TxId, pop_next: bool) -> Option<TxId> {
+        let mut next = None;
         let mut affects = self.affect_txs[txid].lock();
         if affects.is_empty() {
-            return;
+            return next;
         }
         for &tx in affects.iter() {
             let mut dependent = self.dependent_state[tx].lock();
             if dependent.dependency == Some(txid) {
                 dependent.dependency = None;
                 if dependent.onboard {
-                    self.index.fetch_min(tx, Ordering::Relaxed);
+                    if pop_next && tx == txid + 1 && self.index.load(Ordering::Relaxed) > tx {
+                        dependent.onboard = false;
+                        self.num_onboard.fetch_sub(1, Ordering::Relaxed);
+                        next = Some(tx);
+                    } else {
+                        self.index.fetch_min(tx, Ordering::Relaxed);
+                    }
                 }
             }
         }
         affects.clear();
+        next
     }
 
     pub fn add(&self, txid: TxId, dep_id: Option<TxId>) {
