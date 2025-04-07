@@ -3,6 +3,8 @@ use ahash::AHashSet as HashSet;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+static SHORT_DEPENDENCY_DISTANCE: usize = 4;
+
 #[derive(Debug, Clone)]
 struct DependentState {
     onboard: bool,
@@ -75,12 +77,14 @@ impl TxDependency {
         if affects.is_empty() {
             return next;
         }
+        let min_affect = affects.iter().min().cloned().unwrap();
+        let pop_next = pop_next && min_affect - txid <= SHORT_DEPENDENCY_DISTANCE;
         for &tx in affects.iter() {
             let mut dependent = self.dependent_state[tx].lock();
             if dependent.dependency == Some(txid) {
                 dependent.dependency = None;
                 if dependent.onboard {
-                    if pop_next && tx == txid + 1 && self.index.load(Ordering::Relaxed) > tx {
+                    if pop_next && tx == min_affect && self.index.load(Ordering::Relaxed) > tx {
                         dependent.onboard = false;
                         next = Some(tx);
                     } else {
