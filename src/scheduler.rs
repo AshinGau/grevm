@@ -366,16 +366,21 @@ where
             if (Instant::now() - start).as_millis() > 8_000 {
                 start = Instant::now();
                 println!(
-                    "stuck..., block_number: {}, finality_idx: {}, validation_idx: {}, execution_idx: {}",
+                    "stuck..., block_number: {}, finality_idx: {}, validation_idx: {}, execution_idx: {}, block_size: {}",
                     self.env.number,
                     self.scheduler_ctx.finality_idx(),
                     self.scheduler_ctx.validation_idx(),
                     self.scheduler_ctx.executed_set.continuous_idx(),
+                    self.txs.len()
                 );
+                self.tx_dependency.print();
+                println!("tx_status: ");
+                for (idx, tx) in self.tx_states.iter().enumerate() {
+                    print!("tx {}: {:?}", idx, tx.lock().status);
+                }
                 let status: Vec<(TxId, TransactionStatus)> =
                     self.tx_states.iter().map(|s| s.lock().status.clone()).enumerate().collect();
                 println!("transaction status: {:?}", status);
-                self.tx_dependency.print();
             }
         }
     }
