@@ -320,7 +320,6 @@ where
     }
 
     fn async_finality(&self) {
-        let mut start = Instant::now();
         let mut finality_idx = 0;
         let mut lower_ts = 0;
         let dependency_distance = histogram!("grevm.dependency_distance");
@@ -362,30 +361,11 @@ where
                 finality_idx += 1;
             }
             thread::yield_now();
-
-            if (Instant::now() - start).as_millis() > 8_000 {
-                start = Instant::now();
-                println!(
-                    "stuck..., block_number: {}, finality_idx: {}, validation_idx: {}, execution_idx: {}, block_size: {}",
-                    self.env.number,
-                    self.scheduler_ctx.finality_idx(),
-                    self.scheduler_ctx.validation_idx(),
-                    self.scheduler_ctx.executed_set.continuous_idx(),
-                    self.txs.len()
-                );
-                self.tx_dependency.print();
-                println!("tx_status: ");
-                for (idx, tx) in self.tx_states.iter().enumerate() {
-                    print!("tx {}: {:?}", idx, tx.lock().status);
-                }
-                let status: Vec<(TxId, TransactionStatus)> =
-                    self.tx_states.iter().map(|s| s.lock().status.clone()).enumerate().collect();
-                println!("transaction status: {:?}", status);
-            }
         }
     }
 
     fn async_commit(&self, commiter: &Mutex<StateAsyncCommit<DB>>) {
+        let mut start = Instant::now();
         let mut commit_idx = 0;
         let mut commiter = commiter.lock();
         let async_commit_state =
@@ -410,6 +390,36 @@ where
                 commit_idx += 1;
             }
             thread::yield_now();
+            if (Instant::now() - start).as_millis() > 2_000 {
+                start = Instant::now();
+                println!(
+                    "stuck..., block_number: {}, finality_idx: {}, validation_idx: {}, execution_idx: {}, commit_idx: {}, block_size: {}",
+                    self.env.number,
+                    self.scheduler_ctx.finality_idx(),
+                    self.scheduler_ctx.validation_idx(),
+                    self.scheduler_ctx.executed_set.continuous_idx(),
+                    self.scheduler_ctx.commit_idx.load(Ordering::Relaxed),
+                    self.txs.len()
+                );
+                self.tx_dependency.print();
+                println!("unsafe tx_status: ");
+                // 使用unsafe方式直接访问tx_states，避免获取锁导致的死锁
+                unsafe {
+                    for (idx, tx_mutex) in self.tx_states.iter().enumerate() {
+                        // 方法1: 尝试直接访问parking_lot::Mutex的内部数据
+                        let tx_mutex_ptr = tx_mutex as *const Mutex<TxState>;
+                        
+                        // parking_lot::Mutex的内存布局通常是: [RawMutex, T]
+                        // 我们需要跳过RawMutex的大小来访问TxState
+                        let raw_mutex_size = std::mem::size_of::<parking_lot::RawMutex>();
+                        let tx_state_ptr = (tx_mutex_ptr as *const u8).add(raw_mutex_size) as *const TxState;
+                        
+                        let tx_state = &*tx_state_ptr;
+                        print!("tx {} - {}: {:?}, ", idx, tx_state.incarnation, tx_state.status);
+                    }
+                }
+                println!("\nunsafe end");
+            }
         }
     }
 
@@ -558,6 +568,9 @@ where
             panic!("Inconsistent incarnation when execution");
         }
         self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
+        if incarnation > 10 {
+            println!("bad case: tx {} execute {} times", txid, incarnation);
+        }
 
         evm.db_mut().reset_state(TxVersion::new(txid, incarnation));
         let tx_env = self.txs[txid].clone();
@@ -692,6 +705,7 @@ where
     }
 
     fn validate(&self, tx_version: TxVersion) -> Option<Task> {
+        let commit_idx = self.scheduler_ctx.commit_idx.load(Ordering::Acquire);
         let TxVersion { txid, incarnation } = tx_version;
         let mut tx_state = self.tx_states[txid].lock();
         let tx_result = self.tx_results[txid].lock();
@@ -757,6 +771,9 @@ where
         tx_state.dependency = dependency;
 
         if conflict {
+            if commit_idx == txid {
+                println!("tx {} - {} validate failed, but commit_idx={}", txid, incarnation, commit_idx);
+            }
             // update dependency
             let dep_tx = dependency.and_then(|dep| {
                 if dep >= self.scheduler_ctx.finality_idx() { Some(dep) } else { None }
