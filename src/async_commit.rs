@@ -7,6 +7,7 @@ use revm_primitives::Address;
 
 use crate::{GrevmError, ParallelState, TxId};
 use std::cmp::Ordering;
+use tracing::info;
 
 /// `StateAsyncCommit` asynchronously finalizes transaction states,
 /// serving two critical purposes:
@@ -107,6 +108,7 @@ where
                 }
             }
         }
+        info!("debug: tx {} commit, result: {:?}, state: {:?}", txid, result, state);
         self.results.push(result);
         self.state_mut().commit(state);
 

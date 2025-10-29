@@ -301,6 +301,7 @@ where
             result = Some(byte_code);
         }
 
+        info!("tx {:?} read {:?}, version: {:?}, value: {:?}", self.current_tx, location, read_version, result);
         self.read_set.insert(location, read_version);
         Ok(result.expect("No bytecode"))
     }
@@ -394,6 +395,7 @@ where
                 }
             }
             self.read_accounts.insert(address, read_account);
+            info!("tx {:?} read {:?}, version: {:?}, value: {:?}", self.current_tx, location, read_version, result);
             self.read_set.insert(location, read_version);
         }
 
@@ -434,12 +436,14 @@ where
                 self.read_set.get(&LocationAndType::Code(address.clone()))
             {
                 new_ca = true;
+                info!("tx {:?} read {:?} in new contract", self.current_tx, location);
             }
             let slot =
                 if new_ca { U256::default() } else { self.db.storage_ref(address, index)? };
             result = Some(slot.clone());
         }
 
+        info!("tx {:?} read {:?}, version: {:?}, value: {:?}", self.current_tx, location, read_version, result);
         self.read_set.insert(location, read_version);
         Ok(result.expect("No storage slot"))
     }
