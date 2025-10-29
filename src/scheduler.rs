@@ -610,6 +610,7 @@ where
         evm.db_mut().reset_state(TxVersion::new(txid, incarnation));
         let tx_env = self.txs[txid].clone();
         let commit_idx = self.scheduler_ctx.commit_idx.load(Ordering::Acquire);
+        info!("debug: tx {} - {} execution, current commit: {}", txid, incarnation, commit_idx);
         let result = evm.transact_raw(tx_env);
 
         // The `​write_new_locations` mechanism optimizes validation by intelligently reducing
@@ -654,6 +655,7 @@ where
                 }
 
                 if conflict {
+                    info!("debug: tx {} - {} execution conflict, read_accurate_origin: {}, blocking_txs: {:?}", txid, incarnation, read_accurate_origin, blocking_txs);
                     self.metrics.conflict_cnt.fetch_add(1, Ordering::Relaxed);
                     if !read_accurate_origin {
                         self.metrics.conflict_by_miner.fetch_add(1, Ordering::Relaxed);
@@ -692,6 +694,7 @@ where
             }
             Err(e) => {
                 conflict = true;
+                info!("debug: tx {} - {} execution conflict by error: {:?}", txid, incarnation, e);
                 self.metrics.conflict_cnt.fetch_add(1, Ordering::Relaxed);
                 self.metrics.conflict_by_error.fetch_add(1, Ordering::Relaxed);
                 let mut write_set = HashSet::new();
@@ -754,6 +757,7 @@ where
         }
 
         let ts = self.scheduler_ctx.logical_timestamp();
+        info!("debug: tx {} - {} validation, ts: {}", txid, incarnation, ts);
         // check the read version of read set
         let mut conflict = false;
         let mut dependency: Option<TxId> = None;
@@ -787,6 +791,7 @@ where
             // mark write set as estimate
             self.mark_estimate(txid, &result.write_set);
         }
+        info!("debug: tx {} - {} finish validation, conflict: {}", txid, incarnation, conflict);
 
         // update transaction status
         tx_state.status = if conflict {

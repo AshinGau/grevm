@@ -12,6 +12,7 @@ use revm_database::{
 use revm_primitives::{Address, B256, U256};
 use revm_state::{AccountInfo, Bytecode, EvmState};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tracing::info;
 
 /// A trait that provides functionality for applying state transitions in parallel
 /// and creating reverts for a `BundleState`.
@@ -329,6 +330,7 @@ where
         let mut result = None;
         if address == self.coinbase {
             self.accurate_origin = self.commit_idx.load(Ordering::Acquire) == self.current_tx.txid;
+            info!("debug: tx {} - {} read coinbase, accurate_origin: {}", self.current_tx.txid, self.current_tx.incarnation, self.accurate_origin);
             result = self.db.basic_ref(address.clone())?;
         } else {
             let mut read_version = ReadVersion::Storage;
@@ -366,6 +368,7 @@ where
                                 self.accurate_origin = false;
                                 result = Some(AccountInfo::default());
                             }
+                            info!("debug: tx {} - {} read self-destructed, accurate_origin: {}", self.current_tx.txid, self.current_tx.incarnation, self.accurate_origin);
                         }
                         _ => {}
                     }
