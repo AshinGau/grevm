@@ -18,6 +18,7 @@ ahash = "0.8"
 rayon = "1.10.0"
 atomic = "0.6.0"
 parking_lot = "0.12"
+tracing = { version = "0.1.0", default-features = false }
 
 # Alloy
 alloy-evm = { package = "alloy-evm", git = "https://github.com/Galxe/alloy-evm", branch = "v0.15.0-gravity", default-features = false }

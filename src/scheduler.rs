@@ -1,7 +1,7 @@
 use crate::{
-    AbortReason, CONCURRENT_LEVEL, GrevmError, LocationAndType, MemoryEntry, ParallelState,
-    ReadVersion, Task, TransactionResult, TransactionStatus, TxId, TxState, TxVersion,
-    async_commit::StateAsyncCommit, hint::ParallelExecutionHints, storage::CacheDB,
+    AbortReason, CONCURRENT_LEVEL, FALLBACK_SEQUENTIAL, GrevmError, LocationAndType, MemoryEntry,
+    ParallelState, ReadVersion, Task, TransactionResult, TransactionStatus, TxId, TxState,
+    TxVersion, async_commit::StateAsyncCommit, hint::ParallelExecutionHints, storage::CacheDB,
     tx_dependency::TxDependency, utils::ContinuousDetectSet,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
@@ -30,6 +30,7 @@ use std::{
     thread,
     time::Instant,
 };
+use tracing::info;
 
 pub(crate) type MVMemory = DashMap<LocationAndType, BTreeMap<TxId, MemoryEntry>>;
 
@@ -426,9 +427,14 @@ where
             std::env::var("GREVM_CONCURRENT_LEVEL")
                 .map_or(*CONCURRENT_LEVEL, |s| s.parse().unwrap()),
         );
-        let fallback =
-            std::env::var("GREVM_FALLBACK_SEQUENTIAL").map_or(true, |s| s.parse().unwrap());
+        let fallback = *FALLBACK_SEQUENTIAL;
         if fallback && self.block_size < concurrency_level * 4 {
+            info!(
+                "Block {} fallback to sequential execution for: block_size({}) < {}",
+                self.env.number,
+                self.block_size,
+                concurrency_level * 4
+            );
             return self.fallback_sequential();
         }
         let commiter = Mutex::new(StateAsyncCommit::new(
