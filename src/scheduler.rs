@@ -187,10 +187,10 @@ impl SchedulerContext {
 
     fn reset_validation_idx(&self, index: usize) {
         if index < self.num_txs {
-            let ts = self.logical_ts.fetch_add(1, Ordering::AcqRel);
+            let ts = self.logical_ts.fetch_add(1, Ordering::SeqCst);
             // Rolling back the `validation_idx` implies that the commitment time of subsequent
             // transactions must be logically later than the current timestamp.
-            self.lower_ts[index].fetch_max(ts, Ordering::AcqRel);
+            self.lower_ts[index].fetch_max(ts, Ordering::SeqCst);
             let prev = self.validation_idx.fetch_min(index, Ordering::AcqRel);
             if prev > index {
                 self.reset_validation_idx_cnt.fetch_add(1, Ordering::AcqRel);
@@ -199,7 +199,7 @@ impl SchedulerContext {
     }
 
     fn logical_timestamp(&self) -> usize {
-        self.logical_ts.fetch_add(1, Ordering::AcqRel)
+        self.logical_ts.fetch_add(1, Ordering::SeqCst)
     }
 
     fn executed(&self, index: usize) {
@@ -207,7 +207,7 @@ impl SchedulerContext {
     }
 
     fn unconfirmed(&self, index: usize, ts: usize) {
-        self.unconfirmed_ts[index].fetch_max(ts, Ordering::AcqRel);
+        self.unconfirmed_ts[index].fetch_max(ts, Ordering::SeqCst);
     }
 
     fn finished(&self) -> bool {
@@ -336,11 +336,11 @@ where
                 }
                 lower_ts = max(
                     lower_ts,
-                    self.scheduler_ctx.lower_ts[finality_idx].load(Ordering::Acquire),
+                    self.scheduler_ctx.lower_ts[finality_idx].load(Ordering::SeqCst),
                 );
                 // Rolling back the `validation_idx` implies that the commitment time of subsequent
                 // transactions must be logically later than the current timestamp.
-                if self.scheduler_ctx.unconfirmed_ts[finality_idx].load(Ordering::Acquire) <=
+                if self.scheduler_ctx.unconfirmed_ts[finality_idx].load(Ordering::SeqCst) <=
                     lower_ts
                 {
                     break;
