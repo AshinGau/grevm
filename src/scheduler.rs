@@ -413,7 +413,9 @@ where
 
     /// Take `ExecutionResult` and `ParallelState`
     pub fn take_result_and_state(self) -> (Vec<ExecutionResult>, ParallelState<DB>) {
-        (self.results.into_inner(), self.state)
+        let result = self.results.into_inner();
+        info!("debug: final result: {:?}", result);
+        (result, self.state)
     }
 
     /// Paralle execution
