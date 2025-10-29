@@ -390,7 +390,9 @@ where
                     result = Some(info.clone());
                 }
             }
-            self.read_accounts.insert(address, read_account);
+            if result.is_some() {
+                self.read_accounts.insert(address, read_account);
+            }
             self.read_set.insert(location, read_version);
         }
 
