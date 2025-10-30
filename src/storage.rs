@@ -202,6 +202,7 @@ where
                     estimate,
                 );
                 write_set.insert(LocationAndType::Basic(address.clone()));
+                info!("debug: update self-destructed account: {:?}", address);
                 self.mv_memory
                     .entry(LocationAndType::Basic(address.clone()))
                     .or_default()
@@ -241,6 +242,7 @@ where
                 {
                     let location = LocationAndType::Basic(address.clone());
                     write_set.insert(location.clone());
+                    info!("debug: update changed account: {:?}", address);
                     self.mv_memory.entry(location).or_default().insert(
                         self.current_tx.txid,
                         MemoryEntry::new(
@@ -301,7 +303,7 @@ where
             result = Some(byte_code);
         }
 
-        info!("tx {:?} read {:?}, version: {:?}, value: {:?}", self.current_tx, location, read_version, result);
+        info!("debug: tx {:?} read {:?}, version: {:?}, value: {:?}", self.current_tx, location, read_version, result);
         self.read_set.insert(location, read_version);
         Ok(result.expect("No bytecode"))
     }
@@ -397,7 +399,7 @@ where
             if result.is_some() {
                 self.read_accounts.insert(address, read_account);
             }
-            info!("tx {:?} read {:?}, version: {:?}, value: {:?}", self.current_tx, location, read_version, result);
+            info!("debug: tx {:?} read {:?}, version: {:?}, value: {:?}", self.current_tx, location, read_version, result);
             self.read_set.insert(location, read_version);
         }
 
@@ -438,14 +440,14 @@ where
                 self.read_set.get(&LocationAndType::Code(address.clone()))
             {
                 new_ca = true;
-                info!("tx {:?} read {:?} in new contract", self.current_tx, location);
+                info!("debug: tx {:?} read {:?} in new contract", self.current_tx, location);
             }
             let slot =
                 if new_ca { U256::default() } else { self.db.storage_ref(address, index)? };
             result = Some(slot.clone());
         }
 
-        info!("tx {:?} read {:?}, version: {:?}, value: {:?}", self.current_tx, location, read_version, result);
+        info!("debug: tx {:?} read {:?}, version: {:?}, value: {:?}", self.current_tx, location, read_version, result);
         self.read_set.insert(location, read_version);
         Ok(result.expect("No storage slot"))
     }

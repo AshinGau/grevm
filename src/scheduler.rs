@@ -414,7 +414,6 @@ where
     /// Take `ExecutionResult` and `ParallelState`
     pub fn take_result_and_state(self) -> (Vec<ExecutionResult>, ParallelState<DB>) {
         let result = self.results.into_inner();
-        info!("debug: final result: {:?}", result);
         (result, self.state)
     }
 
@@ -423,6 +422,9 @@ where
         &self,
         concurrency_level: Option<usize>,
     ) -> Result<(), GrevmError<DB::Error>> {
+        info!("debug: start to execute block {} with {} transactions",
+            self.env.number,
+            self.block_size);
         let start_time = Instant::now();
         self.metrics.total_tx_cnt.store(self.block_size, Ordering::Relaxed);
         let concurrency_level = concurrency_level.unwrap_or(
