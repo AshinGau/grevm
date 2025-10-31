@@ -431,14 +431,7 @@ where
             std::env::var("GREVM_CONCURRENT_LEVEL")
                 .map_or(*CONCURRENT_LEVEL, |s| s.parse().unwrap()),
         );
-        let fallback = *FALLBACK_SEQUENTIAL;
-        if fallback && self.block_size < concurrency_level * 4 {
-            info!(
-                "Block {} fallback to sequential execution for: block_size({}) < {}",
-                self.env.number,
-                self.block_size,
-                concurrency_level * 4
-            );
+        if *FALLBACK_SEQUENTIAL {
             return self.fallback_sequential();
         }
         let commiter = Mutex::new(StateAsyncCommit::new(
@@ -576,6 +569,7 @@ where
                 let tx_env = self.txs[txid].clone();
                 let result_and_state =
                     evm.transact_raw(tx_env).map_err(|e| GrevmError { txid, error: e.clone() })?;
+                info!("debug: sync tx {} commit, result: {:?}, state: {:?}", txid, result_and_state.result, result_and_state.state);
                 evm.db_mut().commit(result_and_state.state);
                 sequential_results.push(result_and_state.result);
                 self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
