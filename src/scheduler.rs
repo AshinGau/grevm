@@ -422,9 +422,10 @@ where
         &self,
         concurrency_level: Option<usize>,
     ) -> Result<(), GrevmError<DB::Error>> {
-        info!("debug: start to execute block {} with {} transactions",
+        info!("debug: start to execute block {} with {} transactions, cfg: {:?}",
             self.env.number,
-            self.block_size);
+            self.block_size,
+            self.cfg);
         let start_time = Instant::now();
         self.metrics.total_tx_cnt.store(self.block_size, Ordering::Relaxed);
         let concurrency_level = concurrency_level.unwrap_or(
