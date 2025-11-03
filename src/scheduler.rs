@@ -11,7 +11,7 @@ use metrics::histogram;
 use metrics_derive::Metrics;
 use parking_lot::Mutex;
 use revm::{
-    Context, DatabaseCommit, DatabaseRef, MainBuilder, MainContext, handler::EthPrecompiles,
+    Context, DatabaseCommit, DatabaseRef, MainBuilder, MainContext, handler::EthPrecompiles, precompile::{PrecompileSpecId, Precompiles},
 };
 use revm_context::{
     BlockEnv, CfgEnv, TxEnv,
@@ -464,14 +464,15 @@ where
                     // nonce verification, but the nonce will be checked when transaction commit
                     cfg.disable_nonce_check = true;
                     cfg.lazy_reward = true;
+                    let spec_id = cfg.spec;
                     let evm = Context::mainnet()
                         .with_db(cache_db)
                         .with_cfg(cfg)
                         .with_block(self.env.clone())
                         .build_mainnet_with_inspector(NoOpInspector {})
-                        .with_precompiles(PrecompilesMap::from_static(
-                            EthPrecompiles::default().precompiles,
-                        ));
+                        .with_precompiles(PrecompilesMap::from_static(Precompiles::new(
+                            PrecompileSpecId::from_spec_id(spec_id),
+                        )));
                     let mut evm = EthEvm::new(evm, false);
 
                     let mut task = self.next();
@@ -557,14 +558,15 @@ where
         let mut sequential_results = Vec::with_capacity(self.block_size - num_commit);
         let state_mut = self.state_mut();
         {
+            let spec_id = self.cfg.spec;
             let evm = Context::mainnet()
                 .with_db(state_mut)
                 .with_cfg(self.cfg.clone())
                 .with_block(self.env.clone())
                 .build_mainnet_with_inspector(NoOpInspector {})
-                .with_precompiles(PrecompilesMap::from_static(
-                    EthPrecompiles::default().precompiles,
-                ));
+                .with_precompiles(PrecompilesMap::from_static(Precompiles::new(
+                    PrecompileSpecId::from_spec_id(spec_id),
+                )));
             let mut evm = EthEvm::new(evm, false);
             for txid in num_commit..self.block_size {
                 let tx_env = self.txs[txid].clone();
