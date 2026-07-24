@@ -38,10 +38,14 @@ macro_rules! define_execute_metrics {
                 $(#[$field_meta])*
                 $field: RelaxedUsize,
             )+
+            #[cfg(test)]
+            report_count: RelaxedUsize,
         }
 
         impl ExecuteMetricsCollector {
             pub(super) fn report(&self) {
+                #[cfg(test)]
+                self.report_count.increment();
                 let metrics = ExecuteMetrics::default();
                 $(
                     record_execute_metric!(metrics, self, $field $(, $policy)?);
@@ -62,6 +66,10 @@ macro_rules! define_execute_metrics {
                 .collect()
             }
 
+            #[cfg(all(test, feature = "test-utils"))]
+            pub(super) fn report_count(&self) -> usize {
+                self.report_count.get()
+            }
         }
     };
 }

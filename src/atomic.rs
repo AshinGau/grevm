@@ -275,6 +275,120 @@ mod tests {
     }
 
     #[test]
+    fn rewind_requires_newer_validation_before_finality() {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Status {
+            Executed,
+            Unconfirmed,
+            Finality,
+        }
+
+        #[derive(Debug)]
+        struct TransactionState {
+            status: Status,
+            rewind_timestamp: usize,
+            finality_timestamp: usize,
+            validation_claimed: bool,
+        }
+
+        loom::model(|| {
+            use loom::{
+                sync::{
+                    Arc, Mutex,
+                    atomic::{AtomicUsize, Ordering},
+                },
+                thread,
+            };
+
+            // Transaction 0 has completed its first validation at timestamp 1.
+            let validation = Arc::new(AtomicUsize::new(1));
+            let lower = Arc::new(AtomicUsize::new(0));
+            let logical_clock = Arc::new(AtomicUsize::new(2));
+            let cursor = Arc::new(AtomicUsize::new(1));
+            let state = Arc::new(Mutex::new(TransactionState {
+                status: Status::Unconfirmed,
+                rewind_timestamp: 0,
+                finality_timestamp: 0,
+                validation_claimed: false,
+            }));
+
+            let rewind_cursor = Arc::clone(&cursor);
+            let rewind_state = Arc::clone(&state);
+            let rewind_lower = Arc::clone(&lower);
+            let rewind_clock = Arc::clone(&logical_clock);
+            let rewind_thread = thread::spawn(move || {
+                let mut state = rewind_state.lock().unwrap();
+                if state.status == Status::Finality {
+                    return;
+                }
+
+                // This is the production ordering used while the transaction state lock is held:
+                // invalidate the old status, publish the lower timestamp, then reissue validation.
+                state.status = Status::Executed;
+                let timestamp = rewind_clock.fetch_add(1, Ordering::AcqRel);
+                rewind_lower.fetch_max(timestamp, Ordering::AcqRel);
+                rewind(rewind_cursor.as_ref(), 0);
+                state.rewind_timestamp = timestamp;
+            });
+
+            let consumer_cursor = Arc::clone(&cursor);
+            let consumer_state = Arc::clone(&state);
+            let consumer_validation = Arc::clone(&validation);
+            let consumer_lower = Arc::clone(&lower);
+            let consumer_clock = Arc::clone(&logical_clock);
+            let consumer_thread = thread::spawn(move || {
+                if claim_before(consumer_cursor.as_ref(), 1) == Some(0) {
+                    let mut state = consumer_state.lock().unwrap();
+                    state.validation_claimed = true;
+                    if state.status != Status::Finality {
+                        let timestamp = consumer_clock.fetch_add(1, Ordering::AcqRel);
+                        consumer_validation.fetch_max(timestamp, Ordering::AcqRel);
+                        state.status = Status::Unconfirmed;
+                    }
+                }
+
+                // Match lock_finality_candidate: check the validation cursor before taking the
+                // transaction state lock, then decide eligibility while holding that lock.
+                if consumer_cursor.load(Ordering::Acquire) == 0 {
+                    return;
+                }
+
+                let mut state = consumer_state.lock().unwrap();
+                if state.status != Status::Unconfirmed {
+                    return;
+                }
+                let lower = consumer_lower.load(Ordering::Acquire);
+                let validation = consumer_validation.load(Ordering::Acquire);
+                if validation > lower {
+                    state.status = Status::Finality;
+                    state.finality_timestamp = validation;
+                }
+            });
+
+            rewind_thread.join().unwrap();
+            consumer_thread.join().unwrap();
+
+            let state = state.lock().unwrap();
+            let rewind = state.rewind_timestamp;
+            let finality = state.finality_timestamp;
+            if rewind != 0 && finality != 0 {
+                assert!(
+                    finality > rewind,
+                    "a pre-rewind validation must not be eligible for finality"
+                );
+            }
+
+            if rewind != 0 && !state.validation_claimed {
+                assert_eq!(
+                    claim_before(cursor.as_ref(), 1),
+                    Some(0),
+                    "rewind must leave transaction 0 available for validation"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn speculative_work_cursor_never_returns_an_out_of_range_claim() {
         let cursor = SpeculativeWorkCursor::new(0);
         std::thread::scope(|scope| {

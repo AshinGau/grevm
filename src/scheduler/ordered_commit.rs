@@ -268,14 +268,18 @@ mod tests {
         }
     }
 
-    fn make_tx_env_with_auth(caller: Address, pre_nonce: u64, authorities: Vec<Address>) -> TxEnv {
-        let authorization_list = authorities
+    fn make_tx_env_with_auth(
+        caller: Address,
+        pre_nonce: u64,
+        authorizations: Vec<(Address, u64)>,
+    ) -> TxEnv {
+        let authorization_list = authorizations
             .into_iter()
-            .map(|authority| {
+            .map(|(authority, nonce)| {
                 let inner = Authorization {
                     chain_id: U256::ZERO,
                     address: Address::from([0xDE; 20]),
-                    nonce: pre_nonce + 1,
+                    nonce,
                 };
                 Either::Right(RecoveredAuthorization::new_unchecked(
                     inner,
@@ -287,71 +291,77 @@ mod tests {
     }
 
     fn run_commit(state: &mut ParallelState<EmptyDB>, tx_env: TxEnv, post_nonce: u64) {
-        let (_, commit_state) = state.split_for_parallel();
-        let mut commit = OrderedCommitter::try_new(
-            Address::ZERO,
-            SpecId::PRAGUE,
-            0, // basefee: with the tests' zero gas price the reward is 0 regardless
-            commit_state,
-            false, // disable_nonce_check = false: exercise the assertion path
-        )
-        .expect("coinbase preload");
-        let mut output = OrderedCommitOutput::default();
-        assert!(matches!(
-            commit
-                .commit(0, &tx_env, make_result_and_state(tx_env.caller, post_nonce), &mut output,)
-                .expect("commit"),
-            CommitOutcome::Committed(_)
-        ));
-        assert_eq!(output.end(), CommittedPrefixEnd::for_test(1));
+        let caller = tx_env.caller;
+        {
+            let (_, commit_state) = state.split_for_parallel();
+            let mut commit = OrderedCommitter::try_new(
+                Address::ZERO,
+                SpecId::PRAGUE,
+                0, // The zero gas price makes the reward zero regardless of base fee.
+                commit_state,
+                false,
+            )
+            .expect("beneficiary preload");
+            let mut output = OrderedCommitOutput::default();
+            assert!(matches!(
+                commit
+                    .commit(0, &tx_env, make_result_and_state(caller, post_nonce), &mut output,)
+                    .expect("commit"),
+                CommitOutcome::Committed(_)
+            ));
+            assert_eq!(output.end(), CommittedPrefixEnd::for_test(1));
+        }
+        assert_eq!(
+            state.basic_ref(caller).expect("state read").expect("caller account").nonce,
+            post_nonce
+        );
     }
 
-    /// EIP-7702 self-sponsored self-delegation: caller signs the outer tx AND lists itself
-    /// as an authority. revm bumps the caller's nonce twice (once for the tx, once for the
-    /// auth tuple), so post-state nonce = pre + 2. Without the EIP-7702-aware relaxation,
-    /// `assert_eq!(change.info.nonce, expect + 1)` panics with `left: 17, right: 16` — the
-    /// exact signature seen on Gravity testnet block 1400868.
+    /// Model a result in which revm accepted one self-authorization after the outer nonce bump.
+    /// Ordered commit validates the pre-state transaction nonce and preserves the supplied EVM
+    /// post-state.
     #[test]
-    fn self_sponsored_self_delegation_nonce_plus_two_does_not_panic() {
+    fn commit_applies_single_eip7702_authority_nonce_bump() {
         let caller = Address::from([0xCA; 20]);
         let pre_nonce = 15u64;
         let mut state = ParallelState::new(EmptyDB::default(), true, false);
         state.insert_account(caller, make_account_info(pre_nonce));
 
-        let tx_env = make_tx_env_with_auth(caller, pre_nonce, vec![caller]);
+        let tx_env = make_tx_env_with_auth(caller, pre_nonce, vec![(caller, pre_nonce + 1)]);
         run_commit(&mut state, tx_env, pre_nonce + 2);
     }
 
-    /// Two self-auth tuples in the same tx → caller nonce bumps +3. Upper bound of the new
-    /// assertion must scale with the count of `authority == caller` tuples.
+    /// Model two accepted self-authorizations with consecutive authority nonces.
     #[test]
-    fn two_self_auth_tuples_nonce_plus_three_does_not_panic() {
+    fn commit_applies_multiple_eip7702_authority_nonce_bumps() {
         let caller = Address::from([0xCB; 20]);
         let pre_nonce = 7u64;
         let mut state = ParallelState::new(EmptyDB::default(), true, false);
         state.insert_account(caller, make_account_info(pre_nonce));
 
-        let tx_env = make_tx_env_with_auth(caller, pre_nonce, vec![caller, caller]);
+        let tx_env = make_tx_env_with_auth(
+            caller,
+            pre_nonce,
+            vec![(caller, pre_nonce + 1), (caller, pre_nonce + 2)],
+        );
         run_commit(&mut state, tx_env, pre_nonce + 3);
     }
 
-    /// Self-auth tx where the inner authorization is skipped by revm (e.g. nonce mismatch),
-    /// so only the outer tx bumps. Post = pre + 1 must still pass the lower bound.
+    /// Model revm skipping a self-authorization with a mismatched nonce. Ordered commit applies the
+    /// supplied outer-transaction post-state without inferring another increment from the list.
     #[test]
-    fn self_auth_but_only_outer_bump_passes() {
+    fn commit_applies_post_state_when_eip7702_authorization_is_skipped() {
         let caller = Address::from([0xCE; 20]);
         let pre_nonce = 42u64;
         let mut state = ParallelState::new(EmptyDB::default(), true, false);
         state.insert_account(caller, make_account_info(pre_nonce));
 
-        let tx_env = make_tx_env_with_auth(caller, pre_nonce, vec![caller]);
+        let tx_env = make_tx_env_with_auth(caller, pre_nonce, vec![(caller, pre_nonce + 9)]);
         run_commit(&mut state, tx_env, pre_nonce + 1);
     }
 
-    /// `compute_reward` must mirror revm's `post_execution::reward_beneficiary`: pre-LONDON the
-    /// full effective gas price reaches the coinbase; from LONDON the basefee is burned (EIP-1559).
-    /// The mainnet replay harness clamps every pre-Shanghai block to `Merge`, so it never exercises
-    /// the pre-LONDON branch — this test pins both branches deterministically.
+    /// `compute_reward` mirrors revm's `post_execution::reward_beneficiary`: pre-LONDON the full
+    /// effective gas price reaches the beneficiary; from LONDON the basefee is burned (EIP-1559).
     #[test]
     fn compute_reward_matches_eip1559_basefee_burn() {
         let mut state = ParallelState::new(EmptyDB::default(), true, false);
