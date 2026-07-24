@@ -16,6 +16,7 @@
 //! transaction ID and the underlying EVM error. This allows for precise debugging and error
 //! reporting.
 mod async_commit;
+mod atomic;
 mod bundle;
 mod cache_db;
 mod config;

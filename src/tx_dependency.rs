@@ -1,7 +1,9 @@
-use crate::TxId;
+use crate::{
+    TxId,
+    atomic::{PublishedCursorReader, SpeculativeWorkCursor},
+};
 use ahash::AHashSet as HashSet;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug, Clone)]
 struct DependentState {
@@ -19,7 +21,7 @@ pub(crate) struct TxDependency {
     num_txs: usize,
     dependent_state: Vec<Mutex<DependentState>>,
     affect_txs: Vec<Mutex<HashSet<TxId>>>,
-    index: AtomicUsize,
+    index: SpeculativeWorkCursor,
 }
 
 impl TxDependency {
@@ -28,7 +30,7 @@ impl TxDependency {
             num_txs,
             dependent_state: (0..num_txs).map(|_| Default::default()).collect(),
             affect_txs: (0..num_txs).map(|_| Default::default()).collect(),
-            index: AtomicUsize::new(0),
+            index: SpeculativeWorkCursor::new(0),
         }
     }
 
@@ -42,26 +44,23 @@ impl TxDependency {
                 .map(|dep| Mutex::new(DependentState { onboard: true, dependency: dep }))
                 .collect(),
             affect_txs: affect_txs.into_iter().map(Mutex::new).collect(),
-            index: AtomicUsize::new(0),
+            index: SpeculativeWorkCursor::new(0),
         }
     }
 
     pub(crate) fn next(&self) -> Option<TxId> {
-        if self.index.load(Ordering::Relaxed) < self.num_txs {
-            let index = self.index.fetch_add(1, Ordering::Relaxed);
-            if index < self.num_txs {
-                let mut state = self.dependent_state[index].lock();
-                if state.onboard && state.dependency.is_none() {
-                    state.onboard = false;
-                    return Some(index)
-                }
+        if let Some(index) = self.index.claim_before(self.num_txs) {
+            let mut state = self.dependent_state[index].lock();
+            if state.onboard && state.dependency.is_none() {
+                state.onboard = false;
+                return Some(index)
             }
         }
         None
     }
 
     pub(crate) fn index(&self) -> usize {
-        self.index.load(Ordering::Relaxed)
+        self.index.get()
     }
 
     /// The benchmark `bench_dependency_distance` tests how transaction dependency distance affects
@@ -80,11 +79,11 @@ impl TxDependency {
             if dependent.dependency == Some(txid) {
                 dependent.dependency = None;
                 if dependent.onboard {
-                    if pop_next && tx == txid + 1 && self.index.load(Ordering::Relaxed) > tx {
+                    if pop_next && tx == txid + 1 && self.index.get() > tx {
                         dependent.onboard = false;
                         next = Some(tx);
                     } else {
-                        self.index.fetch_min(tx, Ordering::Relaxed);
+                        self.index.rewind(tx);
                     }
                 }
             }
@@ -99,7 +98,7 @@ impl TxDependency {
             let mut state = self.dependent_state[next].lock();
             if state.onboard {
                 state.dependency = None;
-                self.index.fetch_min(next, Ordering::Relaxed);
+                self.index.rewind(next);
             }
         }
     }
@@ -109,16 +108,16 @@ impl TxDependency {
     /// the transaction's own ID). This dependency is only cleared when commit_idx matches txid,
     /// ensuring the transaction can only proceed after obtaining the correct account state. This
     /// mechanism guarantees state consistency while maintaining parallel execution capabilities.
-    pub(crate) fn key_tx(&self, txid: TxId, commit_idx: &AtomicUsize) {
+    pub(crate) fn key_tx(&self, txid: TxId, commit_idx: PublishedCursorReader<'_>) {
         let mut state = self.dependent_state[txid].lock();
-        if txid > commit_idx.load(Ordering::Acquire) {
+        if txid > commit_idx.get() {
             state.dependency = Some(txid);
         }
         if !state.onboard {
             state.onboard = true;
         }
         if state.dependency.is_none() {
-            self.index.fetch_min(txid, Ordering::Relaxed);
+            self.index.rewind(txid);
         }
     }
 
@@ -137,14 +136,14 @@ impl TxDependency {
                 dep_state.onboard = true;
             }
             if dep_state.dependency.is_none() {
-                self.index.fetch_min(dep_id, Ordering::Relaxed);
+                self.index.rewind(dep_id);
             }
         } else {
             let mut state = self.dependent_state[txid].lock();
             if !state.onboard {
                 state.onboard = true;
                 state.dependency = None;
-                self.index.fetch_min(txid, Ordering::Relaxed);
+                self.index.rewind(txid);
             }
         }
     }

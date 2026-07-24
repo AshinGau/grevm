@@ -4,11 +4,12 @@ mod fallback;
 mod metrics;
 #[cfg(test)]
 mod tests;
+mod wait;
 
 use crate::{
     AbortReason, GrevmConfig, GrevmError, LocationAndType, MVMemory, ParallelState, ReadVersion,
     Task, TransactionResult, TransactionStatus, TxExecutionOutcome, TxId, TxState, TxVersion,
-    async_commit::{CommitGuard, StateAsyncCommit},
+    async_commit::StateAsyncCommit,
     cache_db::CacheDB,
     delegated_safety::{DelegatedSafetyConfig, ReservePlanner},
     hint::ParallelExecutionHints,
@@ -20,13 +21,12 @@ use alloy_evm::precompiles::DynPrecompile;
 use context::SchedulerContext;
 use executor::{GrevmExecutor, ParallelTransactionExecutor};
 use metrics::ExecuteMetricsCollector;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use revm::DatabaseRef;
 use revm_context::{BlockEnv, CfgEnv, TxEnv, result::EVMError};
 use revm_primitives::Address;
 
 use std::{
-    cell::UnsafeCell,
     cmp::max,
     fmt::Debug,
     sync::{
@@ -34,8 +34,11 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
+use wait::WaitSlot;
+
+const STALL_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// The `Scheduler` struct is responsible for managing the parallel execution of transactions
 /// in a block. It coordinates the execution, validation, and finalization of transactions
@@ -52,7 +55,7 @@ where
     env: BlockEnv,
     block_size: usize,
     txs: Arc<Vec<TxEnv>>,
-    state: UnsafeCell<ParallelState<DB>>,
+    state: Mutex<ParallelState<DB>>,
     results: Mutex<Vec<TxExecutionOutcome>>,
     tx_states: Vec<Mutex<TxState>>,
     tx_results: Vec<Mutex<Option<TransactionResult<DB::Error>>>>,
@@ -66,14 +69,10 @@ where
 
     abort: AtomicBool,
     abort_reason: OnceLock<AbortReason<DB::Error>>,
+    finality_wait: WaitSlot,
+    commit_wait: WaitSlot,
     metrics: ExecuteMetricsCollector,
 }
-
-// SAFETY: Scheduler is shared across threads via `thread::scope`. The `UnsafeCell<ParallelState>`
-// is safe because: (1) only the commit thread mutates it (via StateAsyncCommit), serialized by
-// finality ordering, (2) worker threads only read via DatabaseRef (DashMap, thread-safe),
-// (3) fallback_sequential() is only called after all threads have joined.
-unsafe impl<DB: DatabaseRef + Send + Sync> Sync for Scheduler<DB> where DB::Error: Send + Sync {}
 
 impl<DB> Debug for Scheduler<DB>
 where
@@ -176,7 +175,7 @@ where
             env,
             block_size: num_txs,
             txs,
-            state: UnsafeCell::new(state),
+            state: Mutex::new(state),
             results: Mutex::new(vec![]),
             tx_states: (0..num_txs).map(|_| Mutex::new(TxState::default())).collect(),
             tx_results: (0..num_txs).map(|_| Mutex::new(None)).collect(),
@@ -188,76 +187,106 @@ where
             reserve_planner,
             abort: AtomicBool::new(false),
             abort_reason: OnceLock::new(),
+            finality_wait: WaitSlot::new(),
+            commit_wait: WaitSlot::new(),
             metrics: ExecuteMetricsCollector::default(),
         }
     }
 
     fn async_finality(&self) {
-        let mut start = Instant::now();
+        self.finality_wait.register_current_thread();
+        let mut last_progress = Instant::now();
         let mut finality_idx = 0;
         let mut lower_ts = 0;
         let dependency_distance = histogram!("grevm.dependency_distance");
-        while !self.abort.load(Ordering::Acquire) && finality_idx < self.block_size {
-            while finality_idx < self.block_size &&
-                finality_idx < self.scheduler_ctx.validation_idx()
+        while !self.is_aborted() && finality_idx < self.block_size {
+            let previous_finality_idx = finality_idx;
+            while let Some((mut tx_state, effective_lower_ts)) =
+                self.lock_finality_candidate(finality_idx, lower_ts)
             {
-                if self.tx_states[finality_idx].lock().status != TransactionStatus::Unconfirmed {
-                    break;
-                }
-                lower_ts = max(
-                    lower_ts,
-                    self.scheduler_ctx.lower_ts[finality_idx].load(Ordering::Acquire),
-                );
-                // Rolling back the `validation_idx` implies that the commitment time of subsequent
-                // transactions must be logically later than the current timestamp.
-                if self.scheduler_ctx.unconfirmed_ts[finality_idx].load(Ordering::Acquire) <=
-                    lower_ts
-                {
-                    break;
-                }
-                let mut tx_state = self.tx_states[finality_idx].lock();
-                if tx_state.status != TransactionStatus::Unconfirmed {
-                    break;
-                }
+                lower_ts = effective_lower_ts;
+                let incarnation = tx_state.incarnation;
+                let dependency = tx_state.dependency;
                 tx_state.status = TransactionStatus::Finality;
-                self.scheduler_ctx.finality_idx.fetch_add(1, Ordering::AcqRel);
+                drop(tx_state);
 
-                if tx_state.incarnation > 1 {
-                    self.metrics.conflict_txs.fetch_add(1, Ordering::Relaxed);
+                let next_finality_idx = finality_idx + 1;
+                self.scheduler_ctx.publish_finality(next_finality_idx);
+                if finality_idx == previous_finality_idx {
+                    // Start commit as soon as the first transaction in this batch is visible.
+                    self.commit_wait.notify();
                 }
-                if let Some(dep_id) = tx_state.dependency {
+
+                if incarnation > 1 {
+                    self.metrics.conflict_txs.increment();
+                }
+                if let Some(dep_id) = dependency {
                     dependency_distance.record((finality_idx - dep_id) as f64);
-                    if tx_state.incarnation == 1 {
-                        self.metrics.one_attempt_with_dependency.fetch_add(1, Ordering::Relaxed);
-                    } else if tx_state.incarnation > 2 {
-                        self.metrics.more_attempts_with_dependency.fetch_add(1, Ordering::Relaxed);
+                    if incarnation == 1 {
+                        self.metrics.one_attempt_with_dependency.increment();
+                    } else if incarnation > 2 {
+                        self.metrics.more_attempts_with_dependency.increment();
                     }
                 } else {
-                    self.metrics.no_dependency_txs.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.no_dependency_txs.increment();
                 }
-                finality_idx += 1;
+                finality_idx = next_finality_idx;
             }
-            thread::yield_now();
+            let progressed = finality_idx > previous_finality_idx;
+            if progressed {
+                last_progress = Instant::now();
+                if finality_idx - previous_finality_idx > 1 {
+                    // Commit may have caught the first notification while this batch was still
+                    // publishing. Wake it once more for the completed suffix.
+                    self.commit_wait.notify();
+                }
+                thread::yield_now();
+            } else {
+                self.finality_wait.wait_while(STALL_TIMEOUT, || {
+                    !self.is_aborted() &&
+                        self.lock_finality_candidate(finality_idx, lower_ts).is_none()
+                });
+            }
 
-            if (Instant::now() - start).as_millis() > 8_000 {
-                start = Instant::now();
+            if last_progress.elapsed() > STALL_TIMEOUT {
+                last_progress = Instant::now();
                 tracing::warn!(
                     target: "grevm::scheduler",
                     block_number = %self.env.number,
                     finality_idx = self.scheduler_ctx.finality_idx(),
                     validation_idx = self.scheduler_ctx.validation_idx(),
-                    execution_idx = self.scheduler_ctx.executed_set.continuous_idx(),
+                    execution_idx = self.scheduler_ctx.execution_frontier(),
                     "parallel execution stuck",
                 );
             }
         }
     }
 
-    fn async_commit(&self, commiter: &Mutex<StateAsyncCommit<DB>>) {
+    fn lock_finality_candidate(
+        &self,
+        finality_idx: usize,
+        lower_ts: usize,
+    ) -> Option<(MutexGuard<'_, TxState>, usize)> {
+        if finality_idx >= self.block_size || finality_idx >= self.scheduler_ctx.validation_idx() {
+            return None;
+        }
+        let tx_state = self.tx_states[finality_idx].lock();
+        if tx_state.status != TransactionStatus::Unconfirmed {
+            return None;
+        }
+
+        // Rolling back validation makes this and every later finality timestamp logically newer.
+        let effective_lower_ts = max(lower_ts, self.scheduler_ctx.lower_timestamp(finality_idx));
+        (self.scheduler_ctx.unconfirmed_timestamp(finality_idx) > effective_lower_ts)
+            .then_some((tx_state, effective_lower_ts))
+    }
+
+    fn async_commit(&self, committer: &mut StateAsyncCommit<DB>) {
+        self.commit_wait.register_current_thread();
         let mut commit_idx = 0;
-        let mut commiter = commiter.lock();
-        while !self.abort.load(Ordering::Acquire) && commit_idx < self.block_size {
-            while commit_idx < self.scheduler_ctx.finality_idx.load(Ordering::Acquire) {
+        while !self.is_aborted() && commit_idx < self.block_size {
+            let previous_commit_idx = commit_idx;
+            while commit_idx < self.scheduler_ctx.finality_idx() {
                 let Some(tx_result) = self.tx_results[commit_idx].lock().take() else {
                     self.abort(AbortReason::ParallelError {
                         txid: commit_idx,
@@ -276,11 +305,9 @@ where
                     return;
                 };
                 let commit_start = Instant::now();
-                let fallback = commiter.commit(commit_idx, &self.txs[commit_idx], result);
-                self.metrics
-                    .commit_time
-                    .fetch_add(commit_start.elapsed().as_nanos() as usize, Ordering::Relaxed);
-                if let Err(error) = commiter.commit_result() {
+                let fallback = committer.commit(commit_idx, &self.txs[commit_idx], result);
+                self.metrics.commit_time.add(commit_start.elapsed().as_nanos() as usize);
+                if let Err(error) = committer.commit_result() {
                     // Commit errors do not live in `tx_results`. Keep the complete error in both
                     // `StateAsyncCommit::commit_result` and the abort reason so either
                     // error-handling path can return the correct txid and source error.
@@ -294,11 +321,18 @@ where
                     self.abort(AbortReason::FallbackSequential);
                     return;
                 }
-                self.scheduler_ctx.commit_idx.fetch_add(1, Ordering::AcqRel);
+                let next_commit_idx = commit_idx + 1;
+                self.scheduler_ctx.publish_commit(next_commit_idx);
                 self.tx_dependency.commit(commit_idx);
-                commit_idx += 1;
+                commit_idx = next_commit_idx;
             }
-            thread::yield_now();
+            if commit_idx > previous_commit_idx {
+                thread::yield_now();
+            } else {
+                self.commit_wait.wait_while(STALL_TIMEOUT, || {
+                    !self.is_aborted() && commit_idx >= self.scheduler_ctx.finality_idx()
+                });
+            }
         }
     }
 
@@ -321,80 +355,79 @@ where
         concurrency_level: Option<usize>,
     ) -> Result<(), GrevmError<DB::Error>> {
         let start_time = Instant::now();
-        self.metrics.total_tx_cnt.store(self.block_size, Ordering::Relaxed);
+        self.metrics.total_tx_cnt.set(self.block_size);
         let concurrency_level = concurrency_level.unwrap_or(self.config.concurrency_level);
         assert!(concurrency_level > 0, "grevm concurrency level must be greater than zero");
         if self.config.force_sequential || self.block_size < self.config.min_parallel_txs {
             return self.fallback_sequential();
         }
-        let commiter = Mutex::new(StateAsyncCommit::new(
-            self.env.beneficiary,
-            self.cfg.spec,
-            self.env.basefee,
-            CommitGuard::new(&self.state),
-            self.cfg.disable_nonce_check,
-        ));
-
-        let state_ref = unsafe { &*self.state.get() };
-        commiter.lock().init().map_err(|e| GrevmError { txid: 0, error: EVMError::Database(e) })?;
-        thread::scope(|scope| {
-            scope.spawn(|| {
-                self.async_finality();
-                self.metrics
-                    .execution_time
-                    .store(start_time.elapsed().as_nanos() as usize, Ordering::Relaxed);
-            });
-            scope.spawn(|| {
-                self.async_commit(&commiter);
-            });
-            for _ in 0..concurrency_level {
+        let (commit_result, committed_results) = {
+            // This lock protects Scheduler's block-level ownership, not transaction processing. It
+            // is acquired once and held while safe, disjoint field borrows are used by workers and
+            // ordered commit.
+            let mut state = self.state.lock();
+            let (state_view, commit_state) = state.split_for_parallel();
+            let mut committer = StateAsyncCommit::new(
+                self.env.beneficiary,
+                self.cfg.spec,
+                self.env.basefee,
+                commit_state,
+                self.cfg.disable_nonce_check,
+            );
+            committer.init().map_err(|e| GrevmError { txid: 0, error: EVMError::Database(e) })?;
+            thread::scope(|scope| {
                 scope.spawn(|| {
-                    let cache_db = CacheDB::new(
-                        self.cfg.spec,
-                        self.env.beneficiary,
-                        state_ref,
-                        &self.mv_memory,
-                        &self.scheduler_ctx.commit_idx,
-                    );
-                    let mut cfg = self.cfg.clone();
-                    // Disable nonce checks during speculative execution. The commit thread checks
-                    // the nonce against committed state; a mismatch leaves the transaction
-                    // uncommitted and triggers sequential revalidation from that transaction.
-                    cfg.disable_nonce_check = true;
-                    let mut executor = GrevmExecutor::new(
-                        cache_db,
-                        cfg,
-                        self.env.clone(),
-                        self.custom_precompiles.as_ref(),
-                        self.config.delegated_safety,
-                        self.reserve_planner.clone(),
-                    );
-                    self.run_worker(&mut executor);
+                    self.async_finality();
+                    self.metrics.execution_time.set(start_time.elapsed().as_nanos() as usize);
                 });
-            }
-        });
-        {
-            let mut commiter = commiter.lock();
-            // Return fatal commit errors. Transaction-validation issues discovered while
-            // committing request sequential fallback without populating `commit_result`.
-            if let Err(e) = commiter.commit_result() {
-                return Err(e.clone());
-            }
-            self.results.lock().extend(commiter.take_result());
+                scope.spawn(|| {
+                    self.async_commit(&mut committer);
+                });
+                for _ in 0..concurrency_level {
+                    scope.spawn(|| {
+                        let cache_db = CacheDB::new(
+                            self.cfg.spec,
+                            self.env.beneficiary,
+                            &state_view,
+                            &self.mv_memory,
+                            self.scheduler_ctx.commit_cursor(),
+                        );
+                        let mut cfg = self.cfg.clone();
+                        // Disable nonce checks during speculative execution. The commit thread
+                        // checks the nonce against committed state; a mismatch leaves the
+                        // transaction uncommitted and triggers sequential revalidation from that
+                        // transaction.
+                        cfg.disable_nonce_check = true;
+                        let mut executor = GrevmExecutor::new(
+                            cache_db,
+                            cfg,
+                            self.env.clone(),
+                            self.custom_precompiles.as_ref(),
+                            self.config.delegated_safety,
+                            self.reserve_planner.clone(),
+                        );
+                        self.run_worker(&mut executor);
+                    });
+                }
+            });
+            (committer.commit_result().clone(), committer.take_result())
+        };
+        // Return fatal commit errors. Transaction-validation issues discovered while committing
+        // request sequential fallback without populating `commit_result`.
+        commit_result?;
+        if !committed_results.is_empty() {
+            self.results.lock().extend(committed_results);
         }
         // Return error if execution failed
         self.post_execute()?;
-        self.metrics.reset_validation_idx_cnt.store(
-            self.scheduler_ctx.reset_validation_idx_cnt.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
-        self.metrics.total_time.store(start_time.elapsed().as_nanos() as usize, Ordering::Relaxed);
+        self.metrics.reset_validation_idx_cnt.set(self.scheduler_ctx.validation_reset_count());
+        self.metrics.total_time.set(start_time.elapsed().as_nanos() as usize);
         self.metrics.report();
         Ok(())
     }
 
     fn post_execute(&self) -> Result<(), GrevmError<DB::Error>> {
-        if self.abort.load(Ordering::Acquire) {
+        if self.is_aborted() {
             match self.abort_reason.get() {
                 Some(AbortReason::FatalEvmError(txid)) => {
                     let error = self.tx_results.get(*txid).and_then(|result| {
@@ -435,7 +468,7 @@ where
                 }
                 None => {
                     return self.fallback_after_parallel_error(
-                        self.scheduler_ctx.commit_idx.load(Ordering::Acquire),
+                        self.scheduler_ctx.committed_idx(),
                         "parallel execution aborted without a reason",
                     );
                 }
@@ -447,6 +480,13 @@ where
     fn abort(&self, abort_reason: AbortReason<DB::Error>) {
         self.abort_reason.get_or_init(|| abort_reason);
         self.abort.store(true, Ordering::Release);
+        self.finality_wait.notify();
+        self.commit_wait.notify();
+    }
+
+    #[inline]
+    fn is_aborted(&self) -> bool {
+        self.abort.load(Ordering::Acquire)
     }
 
     /// After execution, transactions are marked as conflict status in three scenarios:
@@ -455,9 +495,11 @@ where
     /// - ​Unconfirmed Miner/Self-Destruct Accounts: The transaction interacts with miner rewards or
     ///   self-destructed accounts before their committing transaction is finalized (txid ≠
     ///   commit_idx)
-    fn run_worker<'db>(&self, executor: &mut impl ParallelTransactionExecutor<'db, DB>)
-    where
-        DB: 'db,
+    fn run_worker<'db, WorkerDB>(
+        &self,
+        executor: &mut impl ParallelTransactionExecutor<'db, WorkerDB>,
+    ) where
+        WorkerDB: DatabaseRef<Error = DB::Error> + 'db,
     {
         let mut task = self.next();
         while let Some(current_task) = task {
@@ -465,19 +507,19 @@ where
                 Task::Execution(version) => self.execute_task(executor, version),
                 Task::Validation(version) => self.validate(version),
             };
-            if task.is_none() && !self.abort.load(Ordering::Acquire) {
+            if task.is_none() && !self.is_aborted() {
                 task = self.next();
             }
         }
     }
 
-    fn execute_task<'db>(
+    fn execute_task<'db, WorkerDB>(
         &self,
-        executor: &mut impl ParallelTransactionExecutor<'db, DB>,
+        executor: &mut impl ParallelTransactionExecutor<'db, WorkerDB>,
         tx_version: TxVersion,
     ) -> Option<Task>
     where
-        DB: 'db,
+        WorkerDB: DatabaseRef<Error = DB::Error> + 'db,
     {
         let TxVersion { txid, incarnation } = tx_version.clone();
         let mut tx_state = self.tx_states[txid].lock();
@@ -491,10 +533,10 @@ where
             });
             return None;
         }
-        self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
+        self.metrics.execution_cnt.increment();
 
         let tx_env = self.txs[txid].clone();
-        let commit_idx = self.scheduler_ctx.commit_idx.load(Ordering::Acquire);
+        let commit_idx = self.scheduler_ctx.committed_idx();
         let result = executor.transact(tx_version, tx_env);
 
         // The `​write_new_locations` mechanism optimizes validation by intelligently reducing
@@ -539,14 +581,14 @@ where
                 }
 
                 if conflict {
-                    self.metrics.conflict_cnt.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.conflict_cnt.increment();
                     if !read_accurate_origin {
-                        self.metrics.conflict_by_miner.fetch_add(1, Ordering::Relaxed);
+                        self.metrics.conflict_by_miner.increment();
                         // Add all previous transactions as dependencies if miner doesn't accumulate
                         // the rewards
-                        self.tx_dependency.key_tx(txid, &self.scheduler_ctx.commit_idx);
+                        self.tx_dependency.key_tx(txid, self.scheduler_ctx.commit_cursor());
                     } else {
-                        self.metrics.conflict_by_estimate.fetch_add(1, Ordering::Relaxed);
+                        self.metrics.conflict_by_estimate.increment();
                         self.tx_dependency.add(txid, self.generate_dependent_tx(txid, &read_set));
                     }
                 } else {
@@ -578,8 +620,8 @@ where
             Err(e) => {
                 let invalid_transaction = matches!(e, EVMError::Transaction(_));
                 conflict = true;
-                self.metrics.conflict_cnt.fetch_add(1, Ordering::Relaxed);
-                self.metrics.conflict_by_error.fetch_add(1, Ordering::Relaxed);
+                self.metrics.conflict_cnt.increment();
+                self.metrics.conflict_by_error.increment();
                 let mut write_set = HashSet::new();
 
                 let mut last_result = self.tx_results[txid].lock();
@@ -599,7 +641,7 @@ where
                         self.abort(AbortReason::FatalEvmError(txid));
                     }
                 }
-                self.tx_dependency.key_tx(txid, &self.scheduler_ctx.commit_idx);
+                self.tx_dependency.key_tx(txid, self.scheduler_ctx.commit_cursor());
             }
         }
 
@@ -608,15 +650,15 @@ where
         self.scheduler_ctx.executed(txid);
 
         if let Some(next) = next {
-            self.scheduler_ctx.reset_validation_idx(txid);
+            self.scheduler_ctx.rewind_validation_to(txid);
             drop(tx_state);
             return self.execution_task(next);
         }
         if conflict {
-            self.scheduler_ctx.reset_validation_idx(txid + 1);
+            self.scheduler_ctx.rewind_validation_to(txid + 1);
         } else {
             if write_new_locations {
-                self.scheduler_ctx.reset_validation_idx(txid);
+                self.scheduler_ctx.rewind_validation_to(txid);
             } else {
                 tx_state.status = TransactionStatus::Validating;
                 return Some(Task::Validation(TxVersion::new(txid, incarnation)));
@@ -639,7 +681,7 @@ where
             });
             return None;
         }
-        self.metrics.validation_cnt.fetch_add(1, Ordering::Relaxed);
+        self.metrics.validation_cnt.increment();
         let Some(result) = tx_result.as_ref() else {
             self.abort(AbortReason::ParallelError {
                 txid,
@@ -684,15 +726,15 @@ where
             }
         }
         if conflict {
-            self.metrics.conflict_cnt.fetch_add(1, Ordering::Relaxed);
-            self.metrics.conflict_by_version.fetch_add(1, Ordering::Relaxed);
+            self.metrics.conflict_cnt.increment();
+            self.metrics.conflict_by_version.increment();
             // mark write set as estimate
             self.mark_estimate(txid, &result.write_set);
         }
 
         // update transaction status
         tx_state.status = if conflict {
-            self.scheduler_ctx.reset_validation_idx(txid + 1);
+            self.scheduler_ctx.rewind_validation_to(txid + 1);
             TransactionStatus::Conflict
         } else {
             self.scheduler_ctx.unconfirmed(txid, ts);
@@ -704,6 +746,11 @@ where
             // update dependency
             let dep_tx = dependency.filter(|&dep| dep >= self.scheduler_ctx.finality_idx());
             self.tx_dependency.add(txid, dep_tx);
+        }
+        drop(tx_result);
+        drop(tx_state);
+        if txid == self.scheduler_ctx.finality_idx() {
+            self.finality_wait.notify();
         }
         None
     }
@@ -748,13 +795,13 @@ where
             Some(Task::Execution(TxVersion::new(execute_id, tx.incarnation)))
         } else {
             self.tx_dependency.remove(execute_id, false);
-            self.metrics.useless_dependent_update.fetch_add(1, Ordering::Relaxed);
+            self.metrics.useless_dependent_update.increment();
             None
         }
     }
 
     fn next(&self) -> Option<Task> {
-        while !self.scheduler_ctx.finished() && !self.abort.load(Ordering::Acquire) {
+        while !self.scheduler_ctx.finished() && !self.is_aborted() {
             if !self.scheduler_ctx.should_schedule(self.tx_dependency.index()) {
                 thread::yield_now();
             }

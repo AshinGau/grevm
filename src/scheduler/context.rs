@@ -1,83 +1,329 @@
-use crate::utils::ContinuousDetectSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use crate::atomic::{PublishedCursorReader, RelaxedUsize, RewindableCursor};
+use std::{
+    cmp::max,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+
+/// A monotonic, single-writer cursor with read-only views for concurrent consumers.
+///
+/// This type is private to the scheduler context so publication authority cannot escape to cache
+/// or dependency readers.
+#[derive(Debug)]
+#[repr(transparent)]
+struct PublishedCursor(AtomicUsize);
+
+impl PublishedCursor {
+    #[inline]
+    fn new(value: usize) -> Self {
+        Self(AtomicUsize::new(value))
+    }
+
+    #[inline]
+    fn reader(&self) -> PublishedCursorReader<'_> {
+        PublishedCursorReader::new(&self.0)
+    }
+
+    #[inline]
+    fn get(&self) -> usize {
+        self.reader().get()
+    }
+
+    #[inline]
+    fn publish(&self, value: usize) {
+        debug_assert!(value >= self.get(), "published cursors must not move backwards");
+        self.0.store(value, Ordering::Release);
+    }
+}
+
+#[derive(Debug)]
+struct LogicalClock(AtomicUsize);
+
+impl LogicalClock {
+    #[inline]
+    fn new() -> Self {
+        Self(AtomicUsize::new(1))
+    }
+
+    #[inline]
+    fn next(&self) -> usize {
+        self.0.fetch_add(1, Ordering::AcqRel)
+    }
+}
+
+#[derive(Debug)]
+struct TimestampSlot(AtomicUsize);
+
+impl TimestampSlot {
+    #[inline]
+    fn new() -> Self {
+        Self(AtomicUsize::new(0))
+    }
+
+    #[inline]
+    fn record(&self, timestamp: usize) {
+        self.0.fetch_max(timestamp, Ordering::AcqRel);
+    }
+
+    #[inline]
+    fn get(&self) -> usize {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug)]
+struct ExecutionFrontier {
+    executed: Vec<AtomicBool>,
+    frontier: AtomicUsize,
+}
+
+impl ExecutionFrontier {
+    fn new(num_txs: usize) -> Self {
+        Self {
+            executed: (0..num_txs).map(|_| AtomicBool::new(false)).collect(),
+            frontier: AtomicUsize::new(0),
+        }
+    }
+
+    fn advance(&self, mut start: usize) {
+        loop {
+            let mut end = start;
+            while end < self.executed.len() && self.executed[end].load(Ordering::Acquire) {
+                end += 1;
+            }
+            if end == start {
+                return;
+            }
+
+            let current = self.frontier.fetch_max(end, Ordering::AcqRel);
+            start = max(current, end);
+        }
+    }
+
+    /// Publish that `index` has executed at least once.
+    ///
+    /// Only the transaction that fills the current gap attempts to advance the frontier.
+    /// A single atomic update publishes the whole contiguous run that is already complete.
+    fn publish(&self, index: usize) {
+        let frontier = self.frontier.load(Ordering::Acquire);
+        if index < frontier {
+            return;
+        }
+
+        self.executed[index].store(true, Ordering::Release);
+        // Reload after publishing. The frontier may have reached `index` between the first load
+        // and the store; using the stale value would leave the newly filled gap unadvanced.
+        let frontier = self.frontier.load(Ordering::Acquire);
+        if index == frontier {
+            self.advance(frontier);
+        }
+    }
+
+    /// Return the first transaction that has not completed an initial execution.
+    ///
+    /// Readers participate in lock-free progress by advancing a ready frontier if needed.
+    fn current(&self) -> usize {
+        let frontier = self.frontier.load(Ordering::Acquire);
+        // Lock-free helpers may observe a completion whose publishing worker has not advanced the
+        // frontier yet. Help it here so a delayed publisher cannot stall validation progress.
+        if frontier < self.executed.len() && self.executed[frontier].load(Ordering::Acquire) {
+            self.advance(frontier);
+            return self.frontier.load(Ordering::Acquire);
+        }
+        frontier
+    }
+}
 
 /// Lock-free cursors and logical timestamps used by the scheduling state machine.
 pub(super) struct SchedulerContext {
     num_txs: usize,
-    validation_idx: AtomicUsize,
-    pub(super) finality_idx: AtomicUsize,
-    pub(super) commit_idx: AtomicUsize,
-    pub(super) executed_set: ContinuousDetectSet,
-    pub(super) reset_validation_idx_cnt: AtomicUsize,
-    logical_ts: AtomicUsize,
-    pub(super) lower_ts: Vec<AtomicUsize>,
-    pub(super) unconfirmed_ts: Vec<AtomicUsize>,
+    validation: RewindableCursor,
+    finality: PublishedCursor,
+    committed: PublishedCursor,
+    execution_frontier: ExecutionFrontier,
+    validation_resets: RelaxedUsize,
+    logical_clock: LogicalClock,
+    lower_timestamps: Vec<TimestampSlot>,
+    unconfirmed_timestamps: Vec<TimestampSlot>,
 }
 
 impl SchedulerContext {
     pub(super) fn new(num_txs: usize) -> Self {
         Self {
             num_txs,
-            validation_idx: AtomicUsize::new(0),
-            finality_idx: AtomicUsize::new(0),
-            commit_idx: AtomicUsize::new(0),
-            executed_set: ContinuousDetectSet::new(num_txs),
-            reset_validation_idx_cnt: AtomicUsize::new(0),
-            logical_ts: AtomicUsize::new(1),
-            lower_ts: (0..num_txs).map(|_| AtomicUsize::new(0)).collect(),
-            unconfirmed_ts: (0..num_txs).map(|_| AtomicUsize::new(0)).collect(),
+            validation: RewindableCursor::new(0),
+            finality: PublishedCursor::new(0),
+            committed: PublishedCursor::new(0),
+            execution_frontier: ExecutionFrontier::new(num_txs),
+            validation_resets: RelaxedUsize::default(),
+            logical_clock: LogicalClock::new(),
+            lower_timestamps: (0..num_txs).map(|_| TimestampSlot::new()).collect(),
+            unconfirmed_timestamps: (0..num_txs).map(|_| TimestampSlot::new()).collect(),
         }
     }
 
-    pub(super) fn reset_validation_idx(&self, index: usize) {
+    pub(super) fn rewind_validation_to(&self, index: usize) {
         if index >= self.num_txs {
             return;
         }
-        let timestamp = self.logical_ts.fetch_add(1, Ordering::AcqRel);
-        self.lower_ts[index].fetch_max(timestamp, Ordering::AcqRel);
-        let previous = self.validation_idx.fetch_min(index, Ordering::AcqRel);
+        let timestamp = self.logical_clock.next();
+        self.lower_timestamps[index].record(timestamp);
+        let previous = self.validation.rewind(index);
         if previous > index {
-            self.reset_validation_idx_cnt.fetch_add(1, Ordering::AcqRel);
+            self.validation_resets.increment();
         }
     }
 
+    #[inline]
     pub(super) fn logical_timestamp(&self) -> usize {
-        self.logical_ts.fetch_add(1, Ordering::AcqRel)
+        self.logical_clock.next()
     }
 
+    #[inline]
     pub(super) fn executed(&self, index: usize) {
-        self.executed_set.add(index);
+        self.execution_frontier.publish(index);
     }
 
+    #[inline]
     pub(super) fn unconfirmed(&self, index: usize, timestamp: usize) {
-        self.unconfirmed_ts[index].fetch_max(timestamp, Ordering::AcqRel);
+        self.unconfirmed_timestamps[index].record(timestamp);
     }
 
+    #[inline]
     pub(super) fn finished(&self) -> bool {
-        self.finality_idx.load(Ordering::Acquire) >= self.num_txs
+        self.finality.get() >= self.num_txs
     }
 
+    #[inline]
     pub(super) fn finality_idx(&self) -> usize {
-        self.finality_idx.load(Ordering::Acquire)
+        self.finality.get()
     }
 
+    #[inline]
+    pub(super) fn publish_finality(&self, index: usize) {
+        self.finality.publish(index);
+    }
+
+    #[inline]
+    pub(super) fn committed_idx(&self) -> usize {
+        self.committed.get()
+    }
+
+    #[inline]
+    pub(super) fn publish_commit(&self, index: usize) {
+        self.committed.publish(index);
+    }
+
+    #[inline]
+    pub(super) fn commit_cursor(&self) -> PublishedCursorReader<'_> {
+        self.committed.reader()
+    }
+
+    #[inline]
     pub(super) fn validation_idx(&self) -> usize {
-        self.validation_idx.load(Ordering::Acquire)
+        self.validation.get()
     }
 
+    #[inline]
+    pub(super) fn validation_reset_count(&self) -> usize {
+        self.validation_resets.get()
+    }
+
+    #[inline]
+    pub(super) fn lower_timestamp(&self, index: usize) -> usize {
+        self.lower_timestamps[index].get()
+    }
+
+    #[inline]
+    pub(super) fn unconfirmed_timestamp(&self, index: usize) -> usize {
+        self.unconfirmed_timestamps[index].get()
+    }
+
+    #[inline]
+    pub(super) fn execution_frontier(&self) -> usize {
+        self.execution_frontier.current()
+    }
+
+    #[inline]
     pub(super) fn should_schedule(&self, executing_idx: usize) -> bool {
-        let validation_idx = self.validation_idx.load(Ordering::Acquire);
+        let validation_idx = self.validation.get();
         let should_validate =
-            validation_idx < executing_idx && validation_idx < self.executed_set.continuous_idx();
+            validation_idx < executing_idx && validation_idx < self.execution_frontier.current();
         should_validate || executing_idx < self.num_txs
     }
 
+    #[inline]
     pub(super) fn next_validation_idx(&self, executing_idx: usize) -> Option<usize> {
-        let validation_idx = self.validation_idx.load(Ordering::Acquire);
-        if validation_idx >= executing_idx || validation_idx >= self.executed_set.continuous_idx() {
-            return None;
+        let validation_limit = executing_idx.min(self.execution_frontier.current());
+        self.validation.claim_before(validation_limit)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parking_lot::Mutex;
+
+    #[test]
+    fn execution_frontier_advances_over_out_of_order_completions() {
+        let frontier = ExecutionFrontier::new(5);
+        frontier.publish(4);
+        frontier.publish(2);
+        frontier.publish(1);
+        assert_eq!(frontier.current(), 0);
+
+        frontier.publish(0);
+        assert_eq!(frontier.current(), 3);
+
+        frontier.publish(3);
+        assert_eq!(frontier.current(), 5);
+    }
+
+    #[test]
+    fn reader_helps_a_delayed_frontier_publisher() {
+        let frontier = ExecutionFrontier::new(2);
+        frontier.executed[0].store(true, Ordering::Release);
+        assert_eq!(frontier.current(), 1);
+    }
+
+    #[test]
+    fn execution_frontier_handles_concurrent_publishers() {
+        let frontier = ExecutionFrontier::new(1_000);
+        std::thread::scope(|scope| {
+            for offset in 0..8 {
+                let frontier = &frontier;
+                scope.spawn(move || {
+                    for index in (offset..1_000).step_by(8).rev() {
+                        frontier.publish(index);
+                    }
+                });
+            }
+        });
+        assert_eq!(frontier.current(), 1_000);
+    }
+
+    #[test]
+    fn concurrent_validation_claims_do_not_cross_execution_limit() {
+        let context = SchedulerContext::new(32);
+        for index in 0..8 {
+            context.executed(index);
         }
-        let next = self.validation_idx.fetch_add(1, Ordering::AcqRel);
-        (next < self.num_txs).then_some(next)
+
+        let claimed = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let context = &context;
+                let claimed = &claimed;
+                scope.spawn(move || {
+                    while let Some(index) = context.next_validation_idx(5) {
+                        claimed.lock().push(index);
+                    }
+                });
+            }
+        });
+
+        let mut claimed = claimed.into_inner();
+        claimed.sort_unstable();
+        assert_eq!(claimed, (0..5).collect::<Vec<_>>());
+        assert_eq!(context.validation_idx(), 5);
     }
 }

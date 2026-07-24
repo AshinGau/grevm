@@ -1,5 +1,5 @@
+use crate::atomic::RelaxedUsize;
 use metrics_derive::Metrics;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Metrics)]
 #[metrics(scope = "grevm")]
@@ -42,23 +42,23 @@ struct ExecuteMetrics {
 
 #[derive(Default)]
 pub(super) struct ExecuteMetricsCollector {
-    pub(super) total_tx_cnt: AtomicUsize,
-    pub(super) conflict_cnt: AtomicUsize,
-    pub(super) validation_cnt: AtomicUsize,
-    pub(super) execution_cnt: AtomicUsize,
-    pub(super) reset_validation_idx_cnt: AtomicUsize,
-    pub(super) useless_dependent_update: AtomicUsize,
-    pub(super) conflict_by_miner: AtomicUsize,
-    pub(super) conflict_by_error: AtomicUsize,
-    pub(super) conflict_by_estimate: AtomicUsize,
-    pub(super) conflict_by_version: AtomicUsize,
-    pub(super) one_attempt_with_dependency: AtomicUsize,
-    pub(super) more_attempts_with_dependency: AtomicUsize,
-    pub(super) no_dependency_txs: AtomicUsize,
-    pub(super) conflict_txs: AtomicUsize,
-    pub(super) execution_time: AtomicUsize,
-    pub(super) commit_time: AtomicUsize,
-    pub(super) total_time: AtomicUsize,
+    pub(super) total_tx_cnt: RelaxedUsize,
+    pub(super) conflict_cnt: RelaxedUsize,
+    pub(super) validation_cnt: RelaxedUsize,
+    pub(super) execution_cnt: RelaxedUsize,
+    pub(super) reset_validation_idx_cnt: RelaxedUsize,
+    pub(super) useless_dependent_update: RelaxedUsize,
+    pub(super) conflict_by_miner: RelaxedUsize,
+    pub(super) conflict_by_error: RelaxedUsize,
+    pub(super) conflict_by_estimate: RelaxedUsize,
+    pub(super) conflict_by_version: RelaxedUsize,
+    pub(super) one_attempt_with_dependency: RelaxedUsize,
+    pub(super) more_attempts_with_dependency: RelaxedUsize,
+    pub(super) no_dependency_txs: RelaxedUsize,
+    pub(super) conflict_txs: RelaxedUsize,
+    pub(super) execution_time: RelaxedUsize,
+    pub(super) commit_time: RelaxedUsize,
+    pub(super) total_time: RelaxedUsize,
 }
 
 impl ExecuteMetricsCollector {
@@ -78,7 +78,7 @@ impl ExecuteMetricsCollector {
         metrics.more_attempts_with_dependency.record(load(&self.more_attempts_with_dependency));
         metrics.no_dependency_txs.record(load(&self.no_dependency_txs));
         metrics.conflict_txs.record(load(&self.conflict_txs));
-        let execution_time = self.execution_time.load(Ordering::Relaxed);
+        let execution_time = self.execution_time.get();
         if execution_time > 0 {
             metrics.execution_time.record(execution_time as f64);
         }
@@ -87,6 +87,6 @@ impl ExecuteMetricsCollector {
     }
 }
 
-fn load(value: &AtomicUsize) -> f64 {
-    value.load(Ordering::Relaxed) as f64
+fn load(value: &RelaxedUsize) -> f64 {
+    value.get() as f64
 }

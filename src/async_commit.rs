@@ -1,30 +1,12 @@
-use revm::{Database, DatabaseCommit, DatabaseRef};
+use revm::{DatabaseCommit, DatabaseRef};
 use revm_context::{
     Transaction, TxEnv,
     result::{EVMError, ExecutionResult, ResultAndState},
 };
 use revm_primitives::{Address, hardfork::SpecId};
 
-use crate::{GrevmError, ParallelState, TxExecutionOutcome, TxId};
-use std::{cell::UnsafeCell, cmp::Ordering};
-
-/// Only constructible within the commit thread's scope (or sequential fallback).
-/// Guarantees exclusive mutable access to ParallelState.
-pub(crate) struct CommitGuard<'a, DB: DatabaseRef> {
-    state: &'a UnsafeCell<ParallelState<DB>>,
-}
-
-impl<'a, DB: DatabaseRef> CommitGuard<'a, DB> {
-    pub(crate) fn new(state: &'a UnsafeCell<ParallelState<DB>>) -> Self {
-        Self { state }
-    }
-
-    pub(crate) fn state_mut(&mut self) -> &mut ParallelState<DB> {
-        // SAFETY: CommitGuard requires `&mut self`, ensuring exclusive access
-        // to the underlying state for the guard's owner.
-        unsafe { &mut *self.state.get() }
-    }
-}
+use crate::{GrevmError, TxExecutionOutcome, TxId, parallel_state::ParallelStateCommit};
+use std::cmp::Ordering;
 
 /// `StateAsyncCommit` asynchronously finalizes transaction states,
 /// serving two critical purposes:
@@ -43,14 +25,10 @@ where
     /// Block base fee per gas — the burned portion that does not reach the coinbase post-LONDON.
     basefee: u64,
     results: Vec<TxExecutionOutcome>,
-    guard: CommitGuard<'a, DB>,
+    state: ParallelStateCommit<'a, DB>,
     commit_result: Result<(), GrevmError<DB::Error>>,
     disable_nonce_check: bool,
 }
-
-// SAFETY: StateAsyncCommit is only used within a single commit thread (never shared).
-// CommitGuard ensures exclusive mutable access through its `&mut self` requirement.
-unsafe impl<DB: DatabaseRef + Send + Sync> Send for StateAsyncCommit<'_, DB> where DB::Error: Send {}
 
 impl<'a, DB> StateAsyncCommit<'a, DB>
 where
@@ -60,7 +38,7 @@ where
         coinbase: Address,
         spec: SpecId,
         basefee: u64,
-        guard: CommitGuard<'a, DB>,
+        state: ParallelStateCommit<'a, DB>,
         disable_nonce_check: bool,
     ) -> Self {
         Self {
@@ -68,7 +46,7 @@ where
             spec,
             basefee,
             results: vec![],
-            guard,
+            state,
             commit_result: Ok(()),
             disable_nonce_check,
         }
@@ -91,26 +69,12 @@ where
         coinbase_gas_price.saturating_mul(result.gas_used() as u128)
     }
 
-    pub(crate) fn state_mut(&mut self) -> &mut ParallelState<DB> {
-        self.guard.state_mut()
-    }
-
-    /// SAFETY: Shared read access to state is safe because `ParallelState` reads go through
-    /// `DashMap` (thread-safe) or the immutable database.
-    fn state_ref(&self) -> &ParallelState<DB> {
-        // Safe to get a shared reference since we only mutate exclusively when we have `&mut self`
-        unsafe { &*self.guard.state.get() }
-    }
-
     pub(crate) fn init(&mut self) -> Result<(), DB::Error> {
         // Accesses the coinbase account to ensure proper handling of miner rewards (via
         // increment_balances) within ParallelState. This preemptive access guarantees correct state
         // synchronization when applying miner rewards during the final commitment phase.
         let coinbase = self.coinbase;
-        match self.state_mut().basic(coinbase) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e),
-        }
+        self.state.basic_ref(coinbase).map(|_| ())
     }
 
     pub(crate) fn take_result(&mut self) -> Vec<TxExecutionOutcome> {
@@ -134,7 +98,7 @@ where
         // integrity and prevent double-spending attacks.
         let ResultAndState { result, state } = result_and_state;
         if !self.disable_nonce_check {
-            match self.state_ref().basic_ref(tx_env.caller) {
+            match self.state.basic_ref(tx_env.caller) {
                 Ok(info) => {
                     // A non-existent account has Ethereum's default nonce of zero.
                     let expect = info.map_or(0, |info| info.nonce);
@@ -169,7 +133,7 @@ where
         // `ResultAndState.lazy_reward`.
         let reward = self.compute_reward(tx_env, &result);
         self.results.push(TxExecutionOutcome::Executed(result));
-        self.state_mut().commit(state);
+        self.state.commit(state);
 
         // In Ethereum, each transaction includes a miner reward, which would introduce write
         // conflicts in the read-write set if implemented naively, preventing parallel transaction
@@ -179,7 +143,7 @@ where
         // will read the proper miner state from ParallelState (verified via commit_idx) without
         // creating artificial dependencies.
         let coinbase = self.coinbase;
-        if let Err(error) = self.state_mut().increment_balances(vec![(coinbase, reward)]) {
+        if let Err(error) = self.state.increment_balances([(coinbase, reward)]) {
             self.commit_result = Err(GrevmError { txid, error: EVMError::Database(error) });
         }
         false
@@ -189,6 +153,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ParallelState;
     use revm_context::{
         DBErrorMarker,
         either::Either,
@@ -285,12 +250,13 @@ mod tests {
         TxEnv { tx_type: 4, caller, nonce: pre_nonce, authorization_list, ..Default::default() }
     }
 
-    fn run_commit(state: &UnsafeCell<ParallelState<EmptyDB>>, tx_env: TxEnv, post_nonce: u64) {
+    fn run_commit(state: &mut ParallelState<EmptyDB>, tx_env: TxEnv, post_nonce: u64) {
+        let (_, commit_state) = state.split_for_parallel();
         let mut commit = StateAsyncCommit::new(
             Address::ZERO,
             SpecId::PRAGUE,
             0, // basefee: with the tests' zero gas price the reward is 0 regardless
-            CommitGuard::new(state),
+            commit_state,
             false, // disable_nonce_check = false: exercise the assertion path
         );
         commit.init().expect("init");
@@ -311,12 +277,11 @@ mod tests {
     fn self_sponsored_self_delegation_nonce_plus_two_does_not_panic() {
         let caller = Address::from([0xCA; 20]);
         let pre_nonce = 15u64;
-        let state = ParallelState::new(EmptyDB::default(), true, false);
+        let mut state = ParallelState::new(EmptyDB::default(), true, false);
         state.insert_account(caller, make_account_info(pre_nonce));
-        let state_cell = UnsafeCell::new(state);
 
         let tx_env = make_tx_env_with_auth(caller, pre_nonce, vec![caller]);
-        run_commit(&state_cell, tx_env, pre_nonce + 2);
+        run_commit(&mut state, tx_env, pre_nonce + 2);
     }
 
     /// Two self-auth tuples in the same tx → caller nonce bumps +3. Upper bound of the new
@@ -325,12 +290,11 @@ mod tests {
     fn two_self_auth_tuples_nonce_plus_three_does_not_panic() {
         let caller = Address::from([0xCB; 20]);
         let pre_nonce = 7u64;
-        let state = ParallelState::new(EmptyDB::default(), true, false);
+        let mut state = ParallelState::new(EmptyDB::default(), true, false);
         state.insert_account(caller, make_account_info(pre_nonce));
-        let state_cell = UnsafeCell::new(state);
 
         let tx_env = make_tx_env_with_auth(caller, pre_nonce, vec![caller, caller]);
-        run_commit(&state_cell, tx_env, pre_nonce + 3);
+        run_commit(&mut state, tx_env, pre_nonce + 3);
     }
 
     /// Self-auth tx where the inner authorization is skipped by revm (e.g. nonce mismatch),
@@ -339,12 +303,11 @@ mod tests {
     fn self_auth_but_only_outer_bump_passes() {
         let caller = Address::from([0xCE; 20]);
         let pre_nonce = 42u64;
-        let state = ParallelState::new(EmptyDB::default(), true, false);
+        let mut state = ParallelState::new(EmptyDB::default(), true, false);
         state.insert_account(caller, make_account_info(pre_nonce));
-        let state_cell = UnsafeCell::new(state);
 
         let tx_env = make_tx_env_with_auth(caller, pre_nonce, vec![caller]);
-        run_commit(&state_cell, tx_env, pre_nonce + 1);
+        run_commit(&mut state, tx_env, pre_nonce + 1);
     }
 
     /// `compute_reward` must mirror revm's `post_execution::reward_beneficiary`: pre-LONDON the
@@ -353,8 +316,7 @@ mod tests {
     /// the pre-LONDON branch — this test pins both branches deterministically.
     #[test]
     fn compute_reward_matches_eip1559_basefee_burn() {
-        let state = ParallelState::new(EmptyDB::default(), true, false);
-        let state_cell = UnsafeCell::new(state);
+        let mut state = ParallelState::new(EmptyDB::default(), true, false);
 
         let gas_used = 21_000u64;
         let result = ExecutionResult::Success {
@@ -369,23 +331,15 @@ mod tests {
         let basefee = 10u64;
 
         // Pre-LONDON: full price to coinbase, basefee NOT subtracted.
-        let pre = StateAsyncCommit::new(
-            Address::ZERO,
-            SpecId::BERLIN,
-            basefee,
-            CommitGuard::new(&state_cell),
-            true,
-        );
+        let (_, commit_state) = state.split_for_parallel();
+        let pre = StateAsyncCommit::new(Address::ZERO, SpecId::BERLIN, basefee, commit_state, true);
         assert_eq!(pre.compute_reward(&tx_env, &result), 100u128 * gas_used as u128);
+        drop(pre);
 
         // LONDON+: basefee burned, only the priority portion reaches the coinbase.
-        let post = StateAsyncCommit::new(
-            Address::ZERO,
-            SpecId::LONDON,
-            basefee,
-            CommitGuard::new(&state_cell),
-            true,
-        );
+        let (_, commit_state) = state.split_for_parallel();
+        let post =
+            StateAsyncCommit::new(Address::ZERO, SpecId::LONDON, basefee, commit_state, true);
         assert_eq!(post.compute_reward(&tx_env, &result), (100u128 - 10) * gas_used as u128);
     }
 
@@ -393,13 +347,12 @@ mod tests {
     fn reward_database_error_is_recorded_as_commit_error() {
         let caller = Address::from([0xCA; 20]);
         let coinbase = Address::from([0xCB; 20]);
-        let state = ParallelState::new(FailingDb, true, false);
+        let mut state = ParallelState::new(FailingDb, true, false);
         // Committing the transaction itself must not access the failing database. Only the missing
         // coinbase account should fail when the deferred reward is applied.
         state.insert_account(caller, make_account_info(0));
-        let state_cell = UnsafeCell::new(state);
-        let mut commit =
-            StateAsyncCommit::new(coinbase, SpecId::PRAGUE, 0, CommitGuard::new(&state_cell), true);
+        let (_, commit_state) = state.split_for_parallel();
+        let mut commit = StateAsyncCommit::new(coinbase, SpecId::PRAGUE, 0, commit_state, true);
         let tx_env = TxEnv { caller, gas_price: 1, gas_limit: 21_000, ..Default::default() };
 
         commit.commit(7, &tx_env, make_result_and_state(caller, 1));
@@ -412,15 +365,10 @@ mod tests {
     #[test]
     fn nonce_mismatch_is_left_uncommitted_for_sequential_revalidation() {
         let caller = Address::from([0xCC; 20]);
-        let state = ParallelState::new(EmptyDB::default(), true, false);
-        let state_cell = UnsafeCell::new(state);
-        let mut commit = StateAsyncCommit::new(
-            Address::ZERO,
-            SpecId::PRAGUE,
-            0,
-            CommitGuard::new(&state_cell),
-            false,
-        );
+        let mut state = ParallelState::new(EmptyDB::default(), true, false);
+        let (_, commit_state) = state.split_for_parallel();
+        let mut commit =
+            StateAsyncCommit::new(Address::ZERO, SpecId::PRAGUE, 0, commit_state, false);
         commit.init().expect("init");
         let tx_env = TxEnv { caller, nonce: 1, ..Default::default() };
 
@@ -437,16 +385,11 @@ mod tests {
     #[test]
     fn max_nonce_requests_sequential_fallback() {
         let caller = Address::from([0xCD; 20]);
-        let state = ParallelState::new(EmptyDB::default(), true, false);
+        let mut state = ParallelState::new(EmptyDB::default(), true, false);
         state.insert_account(caller, make_account_info(u64::MAX));
-        let state_cell = UnsafeCell::new(state);
-        let mut commit = StateAsyncCommit::new(
-            Address::ZERO,
-            SpecId::PRAGUE,
-            0,
-            CommitGuard::new(&state_cell),
-            false,
-        );
+        let (_, commit_state) = state.split_for_parallel();
+        let mut commit =
+            StateAsyncCommit::new(Address::ZERO, SpecId::PRAGUE, 0, commit_state, false);
         commit.init().expect("init");
         let tx_env = TxEnv { caller, nonce: u64::MAX, ..Default::default() };
 

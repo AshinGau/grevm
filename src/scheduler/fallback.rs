@@ -3,7 +3,6 @@
 use super::{Scheduler, executor::build_evm};
 use crate::{
     GrevmError, InvalidTransaction, TxExecutionOutcome, TxId,
-    async_commit::CommitGuard,
     delegated_safety::{BeneficiaryMode, GrevmHandler, ReserveMode},
 };
 use revm::{DatabaseCommit, DatabaseRef, ExecuteEvm};
@@ -11,8 +10,6 @@ use revm_context::{
     ContextSetters, ContextTr, TxEnv,
     result::{EVMError, ExecutionResult},
 };
-use std::sync::atomic::Ordering;
-
 impl<DB> Scheduler<DB>
 where
     DB: DatabaseRef + Send + Sync,
@@ -41,10 +38,9 @@ where
             return Ok(());
         }
 
-        let mut commit_guard = CommitGuard::new(&self.state);
-        let state = commit_guard.state_mut();
+        let mut state = self.state.lock();
         let evm = build_evm(
-            state,
+            &mut *state,
             self.cfg.clone(),
             self.env.clone(),
             self.custom_precompiles.as_ref(),
@@ -88,7 +84,7 @@ where
                 Err(error) => return Err(GrevmError { txid, error }),
             };
             outcomes.push(outcome);
-            self.metrics.execution_cnt.fetch_add(1, Ordering::Relaxed);
+            self.metrics.execution_cnt.increment();
         }
         Ok(outcomes)
     }
