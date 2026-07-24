@@ -2,7 +2,7 @@
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use grevm::{
-    ParallelState, Scheduler,
+    GrevmConfig, ParallelState, Scheduler,
     test_utils::{
         TRANSFER_GAS_LIMIT,
         common::{account, execute, storage::InMemoryDB},
@@ -31,19 +31,18 @@ fn bench(c: &mut Criterion, name: &str, db: InMemoryDB, txs: Vec<TxEnv>) {
     let mut group = c.benchmark_group(format!("{}({} txs)", name, txs.len()));
     let mut iter_loop = 0;
     let report_metrics = rand::rng().random_range(0..10);
-    let with_hints = std::env::var("WITH_HINTS").is_ok_and(|s| s.parse().unwrap());
     group.bench_function("Grevm Parallel", |b| {
         b.iter(|| {
             let recorder = DebuggingRecorder::new();
             let state = ParallelState::new(db.clone(), true, false);
             metrics::with_local_recorder(&recorder, || {
-                let executor = Scheduler::new(
+                let executor = Scheduler::new_with_runtime_config(
                     black_box(cfg.clone()),
                     black_box(env.clone()),
                     black_box(txs.clone()),
                     black_box(state),
-                    with_hints,
                     None,
+                    GrevmConfig::from_env(),
                 );
                 executor.parallel_execute(None).unwrap();
             });

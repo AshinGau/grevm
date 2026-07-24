@@ -1,7 +1,9 @@
 mod context;
+mod control;
 mod executor;
 mod fallback;
 mod metrics;
+mod ordered_commit;
 #[cfg(test)]
 mod tests;
 mod wait;
@@ -9,18 +11,17 @@ mod wait;
 use crate::{
     AbortReason, GrevmConfig, GrevmError, LocationAndType, MVMemory, ParallelState, ReadVersion,
     Task, TransactionResult, TransactionStatus, TxExecutionOutcome, TxId, TxState, TxVersion,
-    async_commit::StateAsyncCommit,
     cache_db::CacheDB,
     delegated_safety::{DelegatedSafetyConfig, ReservePlanner},
-    hint::ParallelExecutionHints,
     tx_dependency::TxDependency,
 };
-use ::metrics::histogram;
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use alloy_evm::precompiles::DynPrecompile;
 use context::SchedulerContext;
+use control::ExecutionLifecycle;
 use executor::{GrevmExecutor, ParallelTransactionExecutor};
 use metrics::ExecuteMetricsCollector;
+use ordered_commit::{CommitOutcome, CommittedPrefixEnd, OrderedCommitOutput, OrderedCommitter};
 use parking_lot::{Mutex, MutexGuard};
 use revm::DatabaseRef;
 use revm_context::{BlockEnv, CfgEnv, TxEnv, result::EVMError};
@@ -29,16 +30,18 @@ use revm_primitives::Address;
 use std::{
     cmp::max,
     fmt::Debug,
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, OnceLock, atomic::AtomicBool},
     thread,
     time::{Duration, Instant},
 };
 use wait::WaitSlot;
 
 const STALL_TIMEOUT: Duration = Duration::from_secs(8);
+
+struct CommitLoopResult<DBError> {
+    committed: OrderedCommitOutput,
+    error: Option<GrevmError<DBError>>,
+}
 
 /// The `Scheduler` struct is responsible for managing the parallel execution of transactions
 /// in a block. It coordinates the execution, validation, and finalization of transactions
@@ -67,6 +70,7 @@ where
     config: GrevmConfig,
     reserve_planner: Option<Arc<ReservePlanner>>,
 
+    execution: ExecutionLifecycle,
     abort: AtomicBool,
     abort_reason: OnceLock<AbortReason<DB::Error>>,
     finality_wait: WaitSlot,
@@ -93,57 +97,80 @@ where
     DB: DatabaseRef + Send + Sync,
     DB::Error: Clone + Send + Sync + 'static,
 {
-    /// Create a Scheduler for parallel execution
+    /// Create a scheduler using the legacy environment-based runtime configuration.
+    ///
+    /// `legacy_with_hints` is retained for source compatibility and ignored. Static hint inference
+    /// has been removed; dependencies are discovered from speculative reads and writes.
     pub fn new(
         cfg: CfgEnv,
         env: BlockEnv,
         txs: Arc<Vec<TxEnv>>,
         state: ParallelState<DB>,
-        with_hints: bool,
+        legacy_with_hints: bool,
         custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
     ) -> Self {
-        Self::new_with_config(
+        let _ = legacy_with_hints;
+        Self::new_with_runtime_config(
             cfg,
             env,
             txs,
             state,
-            with_hints,
             custom_precompiles,
             GrevmConfig::from_env(),
         )
     }
 
-    /// Create a scheduler with an explicit, block-scoped runtime configuration.
+    /// Create a scheduler with an explicit, block-scoped Grevm runtime configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`GrevmConfig::concurrency_level`] is zero.
+    pub fn new_with_runtime_config(
+        cfg: CfgEnv,
+        env: BlockEnv,
+        txs: Arc<Vec<TxEnv>>,
+        state: ParallelState<DB>,
+        custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
+        config: GrevmConfig,
+    ) -> Self {
+        assert!(config.concurrency_level > 0, "grevm concurrency level must be greater than zero");
+        Self::build(cfg, env, txs, state, custom_precompiles, config)
+    }
+
+    /// Compatibility constructor retaining the legacy static-hints argument.
+    ///
+    /// `legacy_with_hints` is retained for source compatibility. Static hint inference was removed;
+    /// dependencies are discovered from speculative reads and writes during execution.
     pub fn new_with_config(
         cfg: CfgEnv,
         env: BlockEnv,
         txs: Arc<Vec<TxEnv>>,
         state: ParallelState<DB>,
-        with_hints: bool,
+        legacy_with_hints: bool,
         custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
         config: GrevmConfig,
     ) -> Self {
-        assert!(config.concurrency_level > 0, "grevm concurrency level must be greater than zero");
-        Self::build(cfg, env, txs, state, with_hints, custom_precompiles, config)
+        let _ = legacy_with_hints;
+        Self::new_with_runtime_config(cfg, env, txs, state, custom_precompiles, config)
     }
 
     /// Compatibility constructor for callers that only override delegated-account safety.
-    #[deprecated(note = "use Scheduler::new_with_config and GrevmConfig")]
+    #[deprecated(note = "use Scheduler::new_with_runtime_config and GrevmConfig")]
     pub fn new_with_delegated_safety(
         cfg: CfgEnv,
         env: BlockEnv,
         txs: Arc<Vec<TxEnv>>,
         state: ParallelState<DB>,
-        with_hints: bool,
+        legacy_with_hints: bool,
         custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
         delegated_safety: DelegatedSafetyConfig,
     ) -> Self {
-        Self::new_with_config(
+        let _ = legacy_with_hints;
+        Self::new_with_runtime_config(
             cfg,
             env,
             txs,
             state,
-            with_hints,
             custom_precompiles,
             GrevmConfig::from_env().with_delegated_safety(delegated_safety),
         )
@@ -154,18 +181,12 @@ where
         env: BlockEnv,
         txs: Arc<Vec<TxEnv>>,
         state: ParallelState<DB>,
-        with_hints: bool,
         custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
         config: GrevmConfig,
     ) -> Self {
         let num_txs = txs.len();
-        let tx_dependency = if with_hints {
-            ParallelExecutionHints::new(txs.clone()).parse_hints()
-        } else {
-            TxDependency::new(num_txs)
-        };
-        // Construction is O(1): sender indexing and per-account maximum-cost suffixes remain lazy
-        // until surviving delegated execution actually debits an account.
+        // Reserve-planner construction is O(1): sender indexing and per-account maximum-cost
+        // suffixes remain lazy until surviving delegated execution actually debits an account.
         let reserve_planner = config
             .delegated_safety
             .reserve_delegated_balance
@@ -179,12 +200,13 @@ where
             results: Mutex::new(vec![]),
             tx_states: (0..num_txs).map(|_| Mutex::new(TxState::default())).collect(),
             tx_results: (0..num_txs).map(|_| Mutex::new(None)).collect(),
-            tx_dependency,
+            tx_dependency: TxDependency::new(num_txs),
             mv_memory: MVMemory::new(),
             scheduler_ctx: SchedulerContext::new(num_txs),
             custom_precompiles: custom_precompiles.unwrap_or_else(|| Arc::new(Vec::new())),
             config,
             reserve_planner,
+            execution: ExecutionLifecycle::new(),
             abort: AtomicBool::new(false),
             abort_reason: OnceLock::new(),
             finality_wait: WaitSlot::new(),
@@ -193,12 +215,12 @@ where
         }
     }
 
-    fn async_finality(&self) {
+    fn run_finality_loop(&self) {
         self.finality_wait.register_current_thread();
         let mut last_progress = Instant::now();
         let mut finality_idx = 0;
         let mut lower_ts = 0;
-        let dependency_distance = histogram!("grevm.dependency_distance");
+        let dependency_distance = self.metrics.dependency_distance_histogram();
         while !self.is_aborted() && finality_idx < self.block_size {
             let previous_finality_idx = finality_idx;
             while let Some((mut tx_state, effective_lower_ts)) =
@@ -217,18 +239,9 @@ where
                     self.commit_wait.notify();
                 }
 
-                if incarnation > 1 {
-                    self.metrics.conflict_txs.increment();
-                }
+                self.metrics.record_finalized(incarnation, dependency.is_some());
                 if let Some(dep_id) = dependency {
                     dependency_distance.record((finality_idx - dep_id) as f64);
-                    if incarnation == 1 {
-                        self.metrics.one_attempt_with_dependency.increment();
-                    } else if incarnation > 2 {
-                        self.metrics.more_attempts_with_dependency.increment();
-                    }
-                } else {
-                    self.metrics.no_dependency_txs.increment();
                 }
                 finality_idx = next_finality_idx;
             }
@@ -281,8 +294,9 @@ where
             .then_some((tx_state, effective_lower_ts))
     }
 
-    fn async_commit(&self, committer: &mut StateAsyncCommit<DB>) {
+    fn run_commit_loop(&self, committer: &mut OrderedCommitter<DB>) -> CommitLoopResult<DB::Error> {
         self.commit_wait.register_current_thread();
+        let mut output = OrderedCommitOutput::with_capacity(self.block_size);
         let mut commit_idx = 0;
         while !self.is_aborted() && commit_idx < self.block_size {
             let previous_commit_idx = commit_idx;
@@ -292,7 +306,7 @@ where
                         txid: commit_idx,
                         message: "finalized transaction has no execution result",
                     });
-                    return;
+                    return CommitLoopResult { committed: output, error: None };
                 };
                 let Ok(result) = tx_result.execute_result else {
                     // A transaction with an EVM error must never reach finality. This is a
@@ -302,29 +316,32 @@ where
                         txid: commit_idx,
                         message: "failed transaction reached commit",
                     });
-                    return;
+                    return CommitLoopResult { committed: output, error: None };
                 };
                 let commit_start = Instant::now();
-                let fallback = committer.commit(commit_idx, &self.txs[commit_idx], result);
-                self.metrics.commit_time.add(commit_start.elapsed().as_nanos() as usize);
-                if let Err(error) = committer.commit_result() {
-                    // Commit errors do not live in `tx_results`. Keep the complete error in both
-                    // `StateAsyncCommit::commit_result` and the abort reason so either
-                    // error-handling path can return the correct txid and source error.
-                    self.abort(AbortReason::CommitError(error.clone()));
-                    return;
+                let outcome =
+                    committer.commit(commit_idx, &self.txs[commit_idx], result, &mut output);
+                self.metrics.record_commit_time(commit_start.elapsed());
+                match outcome {
+                    Ok(CommitOutcome::Committed(committed)) => {
+                        let next_commit_idx = committed.index();
+                        self.scheduler_ctx.publish_commit(next_commit_idx);
+                        self.tx_dependency.commit(commit_idx);
+                        commit_idx = next_commit_idx;
+                    }
+                    Ok(CommitOutcome::NeedsSequentialFallback) => {
+                        // The problematic transaction remains uncommitted. Keep the cursor at its
+                        // index so sequential fallback revalidates it before processing the suffix.
+                        self.abort(AbortReason::FallbackSequential);
+                        return CommitLoopResult { committed: output, error: None };
+                    }
+                    Err(error) => {
+                        // Wake every scheduler thread immediately, while also returning the exact
+                        // txid and database error directly to the scoped-thread caller.
+                        self.abort(AbortReason::CommitError(error.clone()));
+                        return CommitLoopResult { committed: output, error: Some(error) };
+                    }
                 }
-                if fallback {
-                    // `commit` deliberately leaves the problematic transaction uncommitted. Keep
-                    // the committed-prefix boundary at `commit_idx` so sequential fallback
-                    // revalidates this transaction before processing the suffix.
-                    self.abort(AbortReason::FallbackSequential);
-                    return;
-                }
-                let next_commit_idx = commit_idx + 1;
-                self.scheduler_ctx.publish_commit(next_commit_idx);
-                self.tx_dependency.commit(commit_idx);
-                commit_idx = next_commit_idx;
             }
             if commit_idx > previous_commit_idx {
                 thread::yield_now();
@@ -334,55 +351,55 @@ where
                 });
             }
         }
+        CommitLoopResult { committed: output, error: None }
     }
 
-    /// Take transaction outcomes and `ParallelState`.
-    pub fn take_result_and_state(self) -> (Vec<TxExecutionOutcome>, ParallelState<DB>) {
-        (self.results.into_inner(), self.state.into_inner())
-    }
-
-    /// Execute using the scheduler's unified runtime configuration.
-    pub fn execute(&self) -> Result<(), GrevmError<DB::Error>> {
-        self.parallel_execute(None)
-    }
-
-    /// Execute with an optional per-call concurrency override.
-    ///
-    /// New integrations should configure [`GrevmConfig::concurrency_level`] and call
-    /// [`Self::execute`].
-    pub fn parallel_execute(
+    fn install_commit_loop_result(
         &self,
-        concurrency_level: Option<usize>,
+        result: CommitLoopResult<DB::Error>,
+    ) -> Result<CommittedPrefixEnd, GrevmError<DB::Error>> {
+        let CommitLoopResult { committed: output, error } = result;
+        let committed = output.end();
+        assert_eq!(
+            committed.index(),
+            self.scheduler_ctx.committed_idx(),
+            "ordered output and published commit cursor must describe the same prefix",
+        );
+        let mut results = self.results.lock();
+        assert!(results.is_empty(), "ordered commit outcomes may only be installed once");
+        *results = output.into_outcomes();
+        drop(results);
+        error.map_or(Ok(committed), Err)
+    }
+
+    fn parallel_execute_inner(
+        &self,
+        concurrency_level: usize,
+        start_time: Instant,
     ) -> Result<(), GrevmError<DB::Error>> {
-        let start_time = Instant::now();
-        self.metrics.total_tx_cnt.set(self.block_size);
-        let concurrency_level = concurrency_level.unwrap_or(self.config.concurrency_level);
-        assert!(concurrency_level > 0, "grevm concurrency level must be greater than zero");
         if self.config.force_sequential || self.block_size < self.config.min_parallel_txs {
-            return self.fallback_sequential();
+            return self.replay_uncommitted_suffix(CommittedPrefixEnd::ZERO);
         }
-        let (commit_result, committed_results) = {
+        let commit_thread_result = {
             // This lock protects Scheduler's block-level ownership, not transaction processing. It
             // is acquired once and held while safe, disjoint field borrows are used by workers and
             // ordered commit.
             let mut state = self.state.lock();
             let (state_view, commit_state) = state.split_for_parallel();
-            let mut committer = StateAsyncCommit::new(
+            let mut committer = OrderedCommitter::try_new(
                 self.env.beneficiary,
                 self.cfg.spec,
                 self.env.basefee,
                 commit_state,
                 self.cfg.disable_nonce_check,
-            );
-            committer.init().map_err(|e| GrevmError { txid: 0, error: EVMError::Database(e) })?;
+            )
+            .map_err(|e| GrevmError { txid: 0, error: EVMError::Database(e) })?;
             thread::scope(|scope| {
                 scope.spawn(|| {
-                    self.async_finality();
-                    self.metrics.execution_time.set(start_time.elapsed().as_nanos() as usize);
+                    self.run_finality_loop();
+                    self.metrics.record_execution_time(start_time.elapsed());
                 });
-                scope.spawn(|| {
-                    self.async_commit(&mut committer);
-                });
+                let commit_thread = scope.spawn(|| self.run_commit_loop(&mut committer));
                 for _ in 0..concurrency_level {
                     scope.spawn(|| {
                         let cache_db = CacheDB::new(
@@ -409,84 +426,13 @@ where
                         self.run_worker(&mut executor);
                     });
                 }
-            });
-            (committer.commit_result().clone(), committer.take_result())
+                commit_thread.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
         };
-        // Return fatal commit errors. Transaction-validation issues discovered while committing
-        // request sequential fallback without populating `commit_result`.
-        commit_result?;
-        if !committed_results.is_empty() {
-            self.results.lock().extend(committed_results);
-        }
+        let committed = self.install_commit_loop_result(commit_thread_result)?;
         // Return error if execution failed
-        self.post_execute()?;
-        self.metrics.reset_validation_idx_cnt.set(self.scheduler_ctx.validation_reset_count());
-        self.metrics.total_time.set(start_time.elapsed().as_nanos() as usize);
-        self.metrics.report();
+        self.post_execute(committed)?;
         Ok(())
-    }
-
-    fn post_execute(&self) -> Result<(), GrevmError<DB::Error>> {
-        if self.is_aborted() {
-            match self.abort_reason.get() {
-                Some(AbortReason::FatalEvmError(txid)) => {
-                    let error = self.tx_results.get(*txid).and_then(|result| {
-                        result
-                            .lock()
-                            .as_ref()
-                            .and_then(|result| result.execute_result.as_ref().err().cloned())
-                    });
-                    if let Some(error) = error {
-                        return Err(GrevmError { txid: *txid, error });
-                    }
-
-                    // Losing the execution error is itself a parallel scheduler inconsistency.
-                    // The committed prefix remains authoritative, so replay the suffix.
-                    return self.fallback_after_parallel_error(
-                        *txid,
-                        "fatal execution abort has no matching transaction error",
-                    );
-                }
-                // `parallel_execute` normally returns `commit_result` before reaching this branch.
-                // Keeping the exact error here makes `post_execute` correct on its own as well.
-                Some(AbortReason::CommitError(error)) => return Err(error.clone()),
-                Some(AbortReason::ParallelError { txid, message }) => {
-                    return self.fallback_after_parallel_error(*txid, message);
-                }
-                // Grevm maintains full compatibility with self-destruct operations while
-                // preserving the ability to fall back to sequential execution when necessary.
-                // Although this code path remains theoretically unreachable in normal
-                // operation, we deliberately retain it as a safeguard. Notably, Grevm
-                // implements an optimized rollback mechanism - when parallel execution fails,
-                // the system can resume sequential processing from the problematic transaction
-                // rather than restarting the entire block. This represents a significant
-                // optimization for rare edge cases, effectively preventing severe performance
-                // degradation that could otherwise drastically slow down parallel execution
-                // throughput.
-                Some(AbortReason::SelfDestructed | AbortReason::FallbackSequential) => {
-                    return self.fallback_sequential();
-                }
-                None => {
-                    return self.fallback_after_parallel_error(
-                        self.scheduler_ctx.committed_idx(),
-                        "parallel execution aborted without a reason",
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn abort(&self, abort_reason: AbortReason<DB::Error>) {
-        self.abort_reason.get_or_init(|| abort_reason);
-        self.abort.store(true, Ordering::Release);
-        self.finality_wait.notify();
-        self.commit_wait.notify();
-    }
-
-    #[inline]
-    fn is_aborted(&self) -> bool {
-        self.abort.load(Ordering::Acquire)
     }
 
     /// After execution, transactions are marked as conflict status in three scenarios:
@@ -533,7 +479,7 @@ where
             });
             return None;
         }
-        self.metrics.execution_cnt.increment();
+        self.metrics.record_execution_attempt();
 
         let tx_env = self.txs[txid].clone();
         let commit_idx = self.scheduler_ctx.committed_idx();
@@ -581,14 +527,13 @@ where
                 }
 
                 if conflict {
-                    self.metrics.conflict_cnt.increment();
                     if !read_accurate_origin {
-                        self.metrics.conflict_by_miner.increment();
+                        self.metrics.record_coinbase_conflict();
                         // Add all previous transactions as dependencies if miner doesn't accumulate
                         // the rewards
                         self.tx_dependency.key_tx(txid, self.scheduler_ctx.commit_cursor());
                     } else {
-                        self.metrics.conflict_by_estimate.increment();
+                        self.metrics.record_estimate_conflict();
                         self.tx_dependency.add(txid, self.generate_dependent_tx(txid, &read_set));
                     }
                 } else {
@@ -620,8 +565,7 @@ where
             Err(e) => {
                 let invalid_transaction = matches!(e, EVMError::Transaction(_));
                 conflict = true;
-                self.metrics.conflict_cnt.increment();
-                self.metrics.conflict_by_error.increment();
+                self.metrics.record_evm_error_conflict();
                 let mut write_set = HashSet::new();
 
                 let mut last_result = self.tx_results[txid].lock();
@@ -681,7 +625,7 @@ where
             });
             return None;
         }
-        self.metrics.validation_cnt.increment();
+        self.metrics.record_validation_attempt();
         let Some(result) = tx_result.as_ref() else {
             self.abort(AbortReason::ParallelError {
                 txid,
@@ -726,8 +670,7 @@ where
             }
         }
         if conflict {
-            self.metrics.conflict_cnt.increment();
-            self.metrics.conflict_by_version.increment();
+            self.metrics.record_version_conflict();
             // mark write set as estimate
             self.mark_estimate(txid, &result.write_set);
         }
@@ -795,7 +738,7 @@ where
             Some(Task::Execution(TxVersion::new(execute_id, tx.incarnation)))
         } else {
             self.tx_dependency.remove(execute_id, false);
-            self.metrics.useless_dependent_update.increment();
+            self.metrics.record_useless_dependency_update();
             None
         }
     }

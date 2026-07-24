@@ -8,13 +8,66 @@ use revm_primitives::{Address, hardfork::SpecId};
 use crate::{GrevmError, TxExecutionOutcome, TxId, parallel_state::ParallelStateCommit};
 use std::cmp::Ordering;
 
-/// `StateAsyncCommit` asynchronously finalizes transaction states,
-/// serving two critical purposes:
-/// ensuring Ethereum-compatible execution results and resolving edge cases like miner rewards and
-/// self-destructed accounts. Though state commits strictly follow transaction confirmation order
-/// for correctness, the asynchronous pipeline eliminates any additional block execution latency by
-/// decoupling finalization from the critical path.
-pub(crate) struct StateAsyncCommit<'a, DB>
+#[derive(Debug)]
+pub(crate) enum CommitOutcome {
+    /// The speculative result was committed successfully.
+    Committed(CommittedPrefixEnd),
+    /// The transaction must be revalidated sequentially from the committed prefix.
+    NeedsSequentialFallback,
+}
+
+/// Exclusive end index of the state and outcomes committed in block order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CommittedPrefixEnd(TxId);
+
+impl CommittedPrefixEnd {
+    pub(crate) const ZERO: Self = Self(0);
+
+    fn new(index: TxId) -> Self {
+        Self(index)
+    }
+
+    pub(crate) fn index(self) -> TxId {
+        self.0
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(index: TxId) -> Self {
+        Self(index)
+    }
+}
+
+/// Outcomes produced by the ordered commit stage.
+#[derive(Debug, Default)]
+pub(crate) struct OrderedCommitOutput {
+    outcomes: Vec<TxExecutionOutcome>,
+}
+
+impl OrderedCommitOutput {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self { outcomes: Vec::with_capacity(capacity) }
+    }
+
+    pub(crate) fn end(&self) -> CommittedPrefixEnd {
+        CommittedPrefixEnd::new(self.outcomes.len())
+    }
+
+    pub(crate) fn push(&mut self, result: ExecutionResult) -> CommittedPrefixEnd {
+        self.outcomes.push(TxExecutionOutcome::Executed(result));
+        self.end()
+    }
+
+    pub(crate) fn into_outcomes(self) -> Vec<TxExecutionOutcome> {
+        self.outcomes
+    }
+}
+
+/// Applies finalized transaction state in block order.
+///
+/// Ordered commit preserves Ethereum-compatible results while keeping deferred miner rewards out of
+/// speculative read/write sets. It runs concurrently with execution and validation, so much of its
+/// work can overlap the speculative pipeline.
+pub(crate) struct OrderedCommitter<'a, DB>
 where
     DB: DatabaseRef,
 {
@@ -24,32 +77,32 @@ where
     spec: SpecId,
     /// Block base fee per gas — the burned portion that does not reach the coinbase post-LONDON.
     basefee: u64,
-    results: Vec<TxExecutionOutcome>,
     state: ParallelStateCommit<'a, DB>,
-    commit_result: Result<(), GrevmError<DB::Error>>,
     disable_nonce_check: bool,
 }
 
-impl<'a, DB> StateAsyncCommit<'a, DB>
+impl<'a, DB> OrderedCommitter<'a, DB>
 where
     DB: DatabaseRef,
 {
-    pub(crate) fn new(
+    /// Construct a committer after preloading the coinbase account.
+    ///
+    /// Once this succeeds, deferred reward credits cannot need another database lookup. This makes
+    /// a successful [`Self::commit`] atomic with respect to its returned outcome: state and reward
+    /// are both applied before the caller publishes the committed prefix.
+    pub(crate) fn try_new(
         coinbase: Address,
         spec: SpecId,
         basefee: u64,
         state: ParallelStateCommit<'a, DB>,
         disable_nonce_check: bool,
-    ) -> Self {
-        Self {
-            coinbase,
-            spec,
-            basefee,
-            results: vec![],
-            state,
-            commit_result: Ok(()),
-            disable_nonce_check,
-        }
+    ) -> Result<Self, DB::Error> {
+        let committer = Self { coinbase, spec, basefee, state, disable_nonce_check };
+        // Accesses the coinbase account to ensure proper handling of miner rewards (via
+        // increment_balances) within ParallelState. This preemptive access guarantees correct state
+        // synchronization when applying miner rewards during the final commitment phase.
+        committer.state.basic_ref(coinbase)?;
+        Ok(committer)
     }
 
     /// Self-compute the miner reward for one transaction, mirroring revm's
@@ -69,28 +122,13 @@ where
         coinbase_gas_price.saturating_mul(result.gas_used() as u128)
     }
 
-    pub(crate) fn init(&mut self) -> Result<(), DB::Error> {
-        // Accesses the coinbase account to ensure proper handling of miner rewards (via
-        // increment_balances) within ParallelState. This preemptive access guarantees correct state
-        // synchronization when applying miner rewards during the final commitment phase.
-        let coinbase = self.coinbase;
-        self.state.basic_ref(coinbase).map(|_| ())
-    }
-
-    pub(crate) fn take_result(&mut self) -> Vec<TxExecutionOutcome> {
-        std::mem::take(&mut self.results)
-    }
-
-    pub(crate) fn commit_result(&self) -> &Result<(), GrevmError<DB::Error>> {
-        &self.commit_result
-    }
-
     pub(crate) fn commit(
         &mut self,
         txid: TxId,
         tx_env: &TxEnv,
         result_and_state: ResultAndState,
-    ) -> bool {
+        output: &mut OrderedCommitOutput,
+    ) -> Result<CommitOutcome, GrevmError<DB::Error>> {
         // During Grevm's execution, transaction nonces are temporarily set to `None` to bypass the
         // EVM's strict sequential nonce verification. This design enables concurrent transaction
         // processing without immediate validation failures. However, during the final commitment
@@ -105,25 +143,24 @@ where
                     if tx_env.nonce == u64::MAX && expect == u64::MAX {
                         // Leave the speculative result uncommitted and let sequential execution
                         // classify the nonce overflow as an invalid transaction skip.
-                        return true;
+                        return Ok(CommitOutcome::NeedsSequentialFallback);
                     }
                     match tx_env.nonce.cmp(&expect) {
                         Ordering::Greater => {
                             // Do not finalize the speculative nonce verdict here. Leave this
                             // transaction out of `results` so sequential fallback starts at this
                             // exact transaction and validates it again against committed state.
-                            return true;
+                            return Ok(CommitOutcome::NeedsSequentialFallback);
                         }
                         Ordering::Less => {
                             // See the nonce-too-high branch above: fallback owns the final outcome.
-                            return true;
+                            return Ok(CommitOutcome::NeedsSequentialFallback);
                         }
                         _ => {}
                     }
                 }
                 Err(e) => {
-                    self.commit_result = Err(GrevmError { txid, error: EVMError::Database(e) });
-                    return false;
+                    return Err(GrevmError { txid, error: EVMError::Database(e) });
                 }
             }
         }
@@ -132,7 +169,6 @@ where
         // here instead. This reproduces what the dropped `Galxe/revm` fork returned via
         // `ResultAndState.lazy_reward`.
         let reward = self.compute_reward(tx_env, &result);
-        self.results.push(TxExecutionOutcome::Executed(result));
         self.state.commit(state);
 
         // In Ethereum, each transaction includes a miner reward, which would introduce write
@@ -143,10 +179,10 @@ where
         // will read the proper miner state from ParallelState (verified via commit_idx) without
         // creating artificial dependencies.
         let coinbase = self.coinbase;
-        if let Err(error) = self.state.increment_balances([(coinbase, reward)]) {
-            self.commit_result = Err(GrevmError { txid, error: EVMError::Database(error) });
-        }
-        false
+        self.state
+            .increment_balances([(coinbase, reward)])
+            .map_err(|error| GrevmError { txid, error: EVMError::Database(error) })?;
+        Ok(CommitOutcome::Committed(output.push(result)))
     }
 }
 
@@ -252,20 +288,22 @@ mod tests {
 
     fn run_commit(state: &mut ParallelState<EmptyDB>, tx_env: TxEnv, post_nonce: u64) {
         let (_, commit_state) = state.split_for_parallel();
-        let mut commit = StateAsyncCommit::new(
+        let mut commit = OrderedCommitter::try_new(
             Address::ZERO,
             SpecId::PRAGUE,
             0, // basefee: with the tests' zero gas price the reward is 0 regardless
             commit_state,
             false, // disable_nonce_check = false: exercise the assertion path
-        );
-        commit.init().expect("init");
-        commit.commit(0, &tx_env, make_result_and_state(tx_env.caller, post_nonce));
-        assert!(
-            commit.commit_result().is_ok(),
-            "commit_result should be Ok, got {:?}",
-            commit.commit_result()
-        );
+        )
+        .expect("coinbase preload");
+        let mut output = OrderedCommitOutput::default();
+        assert!(matches!(
+            commit
+                .commit(0, &tx_env, make_result_and_state(tx_env.caller, post_nonce), &mut output,)
+                .expect("commit"),
+            CommitOutcome::Committed(_)
+        ));
+        assert_eq!(output.end(), CommittedPrefixEnd::for_test(1));
     }
 
     /// EIP-7702 self-sponsored self-delegation: caller signs the outer tx AND lists itself
@@ -331,34 +369,56 @@ mod tests {
         let basefee = 10u64;
 
         // Pre-LONDON: full price to coinbase, basefee NOT subtracted.
-        let (_, commit_state) = state.split_for_parallel();
-        let pre = StateAsyncCommit::new(Address::ZERO, SpecId::BERLIN, basefee, commit_state, true);
-        assert_eq!(pre.compute_reward(&tx_env, &result), 100u128 * gas_used as u128);
-        drop(pre);
+        {
+            let (_, commit_state) = state.split_for_parallel();
+            let pre = OrderedCommitter::try_new(
+                Address::ZERO,
+                SpecId::BERLIN,
+                basefee,
+                commit_state,
+                true,
+            )
+            .expect("coinbase preload");
+            assert_eq!(pre.compute_reward(&tx_env, &result), 100u128 * gas_used as u128);
+        }
 
         // LONDON+: basefee burned, only the priority portion reaches the coinbase.
         let (_, commit_state) = state.split_for_parallel();
         let post =
-            StateAsyncCommit::new(Address::ZERO, SpecId::LONDON, basefee, commit_state, true);
+            OrderedCommitter::try_new(Address::ZERO, SpecId::LONDON, basefee, commit_state, true)
+                .expect("coinbase preload");
         assert_eq!(post.compute_reward(&tx_env, &result), (100u128 - 10) * gas_used as u128);
     }
 
     #[test]
-    fn reward_database_error_is_recorded_as_commit_error() {
-        let caller = Address::from([0xCA; 20]);
+    fn coinbase_database_error_prevents_committer_construction() {
         let coinbase = Address::from([0xCB; 20]);
         let mut state = ParallelState::new(FailingDb, true, false);
-        // Committing the transaction itself must not access the failing database. Only the missing
-        // coinbase account should fail when the deferred reward is applied.
-        state.insert_account(caller, make_account_info(0));
         let (_, commit_state) = state.split_for_parallel();
-        let mut commit = StateAsyncCommit::new(coinbase, SpecId::PRAGUE, 0, commit_state, true);
-        let tx_env = TxEnv { caller, gas_price: 1, gas_limit: 21_000, ..Default::default() };
 
-        commit.commit(7, &tx_env, make_result_and_state(caller, 1));
+        assert!(matches!(
+            OrderedCommitter::try_new(coinbase, SpecId::PRAGUE, 0, commit_state, true),
+            Err(TestDbError)
+        ));
+    }
 
-        let error = commit.commit_result().as_ref().expect_err("reward DB error must be returned");
-        assert_eq!(error.txid, 7);
+    #[test]
+    fn nonce_database_error_is_returned_with_txid() {
+        let caller = Address::from([0xCC; 20]);
+        let mut state = ParallelState::new(FailingDb, true, false);
+        state.insert_account(Address::ZERO, make_account_info(0));
+        let (_, commit_state) = state.split_for_parallel();
+        let mut commit =
+            OrderedCommitter::try_new(Address::ZERO, SpecId::PRAGUE, 0, commit_state, false)
+                .expect("coinbase preload");
+        let tx_env = TxEnv { caller, ..Default::default() };
+        let mut output = OrderedCommitOutput::default();
+
+        let error = commit
+            .commit(11, &tx_env, make_result_and_state(caller, 1), &mut output)
+            .expect_err("nonce lookup DB error must be returned");
+
+        assert_eq!(error.txid, 11);
         assert!(matches!(error.error, EVMError::Database(TestDbError)));
     }
 
@@ -368,18 +428,17 @@ mod tests {
         let mut state = ParallelState::new(EmptyDB::default(), true, false);
         let (_, commit_state) = state.split_for_parallel();
         let mut commit =
-            StateAsyncCommit::new(Address::ZERO, SpecId::PRAGUE, 0, commit_state, false);
-        commit.init().expect("init");
+            OrderedCommitter::try_new(Address::ZERO, SpecId::PRAGUE, 0, commit_state, false)
+                .expect("coinbase preload");
         let tx_env = TxEnv { caller, nonce: 1, ..Default::default() };
+        let mut output = OrderedCommitOutput::default();
 
-        let fallback = commit.commit(0, &tx_env, make_result_and_state(caller, 1));
+        let outcome = commit
+            .commit(0, &tx_env, make_result_and_state(caller, 1), &mut output)
+            .expect("nonce lookup");
 
-        assert!(fallback, "nonce-too-high sender must request sequential fallback");
-        assert!(commit.commit_result().is_ok());
-        assert!(
-            commit.take_result().is_empty(),
-            "the mismatched transaction must be revalidated by sequential fallback"
-        );
+        assert!(matches!(outcome, CommitOutcome::NeedsSequentialFallback));
+        assert_eq!(output.end(), CommittedPrefixEnd::ZERO);
     }
 
     #[test]
@@ -389,14 +448,31 @@ mod tests {
         state.insert_account(caller, make_account_info(u64::MAX));
         let (_, commit_state) = state.split_for_parallel();
         let mut commit =
-            StateAsyncCommit::new(Address::ZERO, SpecId::PRAGUE, 0, commit_state, false);
-        commit.init().expect("init");
+            OrderedCommitter::try_new(Address::ZERO, SpecId::PRAGUE, 0, commit_state, false)
+                .expect("coinbase preload");
         let tx_env = TxEnv { caller, nonce: u64::MAX, ..Default::default() };
+        let mut output = OrderedCommitOutput::default();
 
-        let fallback = commit.commit(9, &tx_env, make_result_and_state(caller, u64::MAX));
+        let outcome = commit
+            .commit(9, &tx_env, make_result_and_state(caller, u64::MAX), &mut output)
+            .expect("nonce lookup");
 
-        assert!(fallback, "nonce overflow must be revalidated by sequential fallback");
-        assert!(commit.commit_result().is_ok());
-        assert!(commit.take_result().is_empty(), "overflow transaction must not be committed");
+        assert!(matches!(outcome, CommitOutcome::NeedsSequentialFallback));
+        assert_eq!(output.end(), CommittedPrefixEnd::ZERO);
+    }
+
+    #[test]
+    fn ordered_output_tracks_a_contiguous_committed_prefix() {
+        let mut output = OrderedCommitOutput::default();
+        assert_eq!(output.end(), CommittedPrefixEnd::ZERO);
+        let committed = output.push(ExecutionResult::Success {
+            reason: SuccessReason::Stop,
+            gas_used: 21_000,
+            gas_refunded: 0,
+            logs: Vec::new(),
+            output: Output::Call(Bytes::new()),
+        });
+        assert_eq!(committed, CommittedPrefixEnd::for_test(1));
+        assert_eq!(output.into_outcomes().len(), 1);
     }
 }

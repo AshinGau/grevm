@@ -15,13 +15,11 @@
 //! Errors during execution are encapsulated in the `GrevmError` type, which includes the
 //! transaction ID and the underlying EVM error. This allows for precise debugging and error
 //! reporting.
-mod async_commit;
 mod atomic;
 mod bundle;
 mod cache_db;
 mod config;
 mod delegated_safety;
-mod hint;
 mod model;
 mod outcome;
 mod parallel_state;

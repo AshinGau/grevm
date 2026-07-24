@@ -46,11 +46,11 @@ fn erc20_gigagas() {
         true,
         false,
         [
-            ("grevm.parallel_round_calls", 1),
-            ("grevm.sequential_execute_calls", 0),
-            ("grevm.parallel_tx_cnt", block_size),
-            ("grevm.conflict_tx_cnt", 0),
-            ("grevm.skip_validation_cnt", block_size),
+            ("grevm.total_tx_cnt", block_size),
+            ("grevm.execution_cnt", block_size),
+            ("grevm.conflict_cnt", 0),
+            ("grevm.no_dependency_txs", block_size),
+            ("grevm.conflict_txs", 0),
         ]
         .into_iter()
         .collect(),
@@ -58,7 +58,7 @@ fn erc20_gigagas() {
 }
 
 #[test]
-fn erc20_hints_test() {
+fn legacy_hint_flag_does_not_change_execution_correctness() {
     let account1 = account::mock_eoa_address(1);
     let account2 = account::mock_eoa_address(2);
     let account3 = account::mock_eoa_address(3);
@@ -113,6 +113,7 @@ fn erc20_hints_test() {
     txs[0].data = call_data.clone();
     txs[1].data = call_data.clone();
     let db = InMemoryDB::new(accounts, bytecodes, Default::default());
+    execute::compare_evm_execute(db.clone(), txs.clone(), false, false, Default::default());
     execute::compare_evm_execute(db, txs, true, false, Default::default());
 }
 

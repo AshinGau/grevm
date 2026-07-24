@@ -34,20 +34,6 @@ impl TxDependency {
         }
     }
 
-    pub(crate) fn create(dependent_tx: Vec<Option<TxId>>, affect_txs: Vec<HashSet<TxId>>) -> Self {
-        assert_eq!(dependent_tx.len(), affect_txs.len());
-        let num_txs = dependent_tx.len();
-        Self {
-            num_txs,
-            dependent_state: dependent_tx
-                .into_iter()
-                .map(|dep| Mutex::new(DependentState { onboard: true, dependency: dep }))
-                .collect(),
-            affect_txs: affect_txs.into_iter().map(Mutex::new).collect(),
-            index: SpeculativeWorkCursor::new(0),
-        }
-    }
-
     pub(crate) fn next(&self) -> Option<TxId> {
         if let Some(index) = self.index.claim_before(self.num_txs) {
             let mut state = self.dependent_state[index].lock();

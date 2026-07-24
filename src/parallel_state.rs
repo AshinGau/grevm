@@ -9,7 +9,16 @@ use revm_database::{
 };
 use revm_primitives::{Address, B256, HashMap, U256};
 use revm_state::{Account, AccountInfo, Bytecode, EvmState};
-use std::{fmt::Formatter, time::Instant, vec::Vec};
+use std::{
+    fmt::Formatter,
+    time::{Duration, Instant},
+    vec::Vec,
+};
+
+#[inline]
+fn duration_micros(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000_000.0
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct CacheAccountInfo {
@@ -525,7 +534,7 @@ impl<'a, DB: DatabaseRef> ParallelStateView<'a, DB> {
         if self.update_db_metrics {
             let start = Instant::now();
             let result = func();
-            self.db_latency.record(start.elapsed().as_nanos() as f64);
+            self.db_latency.record(duration_micros(start.elapsed()));
             result
         } else {
             func()
@@ -953,5 +962,16 @@ impl<DB: DatabaseRef> DatabaseCommit for ParallelState<DB> {
     fn commit(&mut self, evm_state: HashMap<Address, Account>) {
         let transitions = self.cache.apply_evm_state(evm_state);
         self.apply_transition(transitions);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duration_micros_preserves_sub_microsecond_precision() {
+        assert_eq!(duration_micros(Duration::from_nanos(1_500)), 1.5);
+        assert_eq!(duration_micros(Duration::from_secs(2)), 2_000_000.0);
     }
 }

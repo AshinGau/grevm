@@ -4,8 +4,8 @@
 
 use alloy_evm::precompiles::DynPrecompile;
 use grevm::{
-    DelegatedSafetyConfig, GrevmConfig, InvalidTransaction, ParallelState, ParallelTakeBundle,
-    Scheduler, TxExecutionOutcome,
+    DelegatedSafetyConfig, GrevmConfig, InvalidTransaction, ParallelState, Scheduler,
+    TxExecutionOutcome,
     test_utils::{
         TRANSFER_GAS_LIMIT,
         common::{account, execute, storage::InMemoryDB},
@@ -273,18 +273,17 @@ fn execute_block_with_precompiles(
         min_parallel_txs: 0,
         delegated_safety: safety,
     };
-    let scheduler = Scheduler::new_with_config(
+    let scheduler = Scheduler::new_with_runtime_config(
         CfgEnv::new_with_spec(SpecId::PRAGUE),
         block,
         txs,
         state,
-        false,
         custom_precompiles,
         config,
     );
     scheduler.execute().expect("block execution failed");
     let (outcomes, mut state) = scheduler.take_result_and_state();
-    let bundle = state.parallel_take_bundle(BundleRetention::Reverts);
+    let bundle = state.finalize_bundle(BundleRetention::Reverts);
     (outcomes, bundle)
 }
 

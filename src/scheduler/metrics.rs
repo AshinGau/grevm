@@ -1,92 +1,258 @@
 use crate::atomic::RelaxedUsize;
 use metrics_derive::Metrics;
+#[cfg(feature = "test-utils")]
+use std::collections::BTreeMap;
+use std::time::Duration;
 
-#[derive(Metrics)]
-#[metrics(scope = "grevm")]
-struct ExecuteMetrics {
-    /// Total transactions.
-    total_tx_cnt: metrics::Histogram,
-    /// Conflict incarnations.
-    conflict_cnt: metrics::Histogram,
-    /// Validation incarnations.
-    validation_cnt: metrics::Histogram,
-    /// Execution incarnations.
-    execution_cnt: metrics::Histogram,
-    /// Validation cursor resets.
-    reset_validation_idx_cnt: metrics::Histogram,
-    /// Dependency updates without work.
-    useless_dependent_update: metrics::Histogram,
-    /// Coinbase conflicts.
-    conflict_by_miner: metrics::Histogram,
-    /// EVM error conflicts.
-    conflict_by_error: metrics::Histogram,
-    /// Estimate read conflicts.
-    conflict_by_estimate: metrics::Histogram,
-    /// Version conflicts.
-    conflict_by_version: metrics::Histogram,
-    /// Transactions completed in one dependency attempt.
-    one_attempt_with_dependency: metrics::Histogram,
-    /// Transactions needing more than two dependency attempts.
-    more_attempts_with_dependency: metrics::Histogram,
-    /// Transactions without dependencies.
-    no_dependency_txs: metrics::Histogram,
-    /// Transactions with at least one conflict.
-    conflict_txs: metrics::Histogram,
-    /// Parallel execution time in nanoseconds.
-    execution_time: metrics::Histogram,
-    /// Commit time in nanoseconds.
-    commit_time: metrics::Histogram,
-    /// Total time in nanoseconds.
-    total_time: metrics::Histogram,
+macro_rules! record_execute_metric {
+    ($metrics:ident, $collector:expr, $field:ident) => {
+        $metrics.$field.record(($collector).$field.get() as f64);
+    };
+    ($metrics:ident, $collector:expr, $field:ident, skip_zero) => {{
+        let value = ($collector).$field.get();
+        if value > 0 {
+            $metrics.$field.record(value as f64);
+        }
+    }};
 }
 
-#[derive(Default)]
-pub(super) struct ExecuteMetricsCollector {
-    pub(super) total_tx_cnt: RelaxedUsize,
-    pub(super) conflict_cnt: RelaxedUsize,
-    pub(super) validation_cnt: RelaxedUsize,
-    pub(super) execution_cnt: RelaxedUsize,
-    pub(super) reset_validation_idx_cnt: RelaxedUsize,
-    pub(super) useless_dependent_update: RelaxedUsize,
-    pub(super) conflict_by_miner: RelaxedUsize,
-    pub(super) conflict_by_error: RelaxedUsize,
-    pub(super) conflict_by_estimate: RelaxedUsize,
-    pub(super) conflict_by_version: RelaxedUsize,
-    pub(super) one_attempt_with_dependency: RelaxedUsize,
-    pub(super) more_attempts_with_dependency: RelaxedUsize,
-    pub(super) no_dependency_txs: RelaxedUsize,
-    pub(super) conflict_txs: RelaxedUsize,
-    pub(super) execution_time: RelaxedUsize,
-    pub(super) commit_time: RelaxedUsize,
-    pub(super) total_time: RelaxedUsize,
+macro_rules! define_execute_metrics {
+    (
+        $(
+            $(#[$field_meta:meta])*
+            $field:ident $(=> $policy:ident)?;
+        )+
+    ) => {
+        #[derive(Metrics)]
+        #[metrics(scope = "grevm")]
+        struct ExecuteMetrics {
+            $(
+                $(#[$field_meta])*
+                $field: metrics::Histogram,
+            )+
+        }
+
+        #[derive(Default)]
+        pub(super) struct ExecuteMetricsCollector {
+            $(
+                $(#[$field_meta])*
+                $field: RelaxedUsize,
+            )+
+        }
+
+        impl ExecuteMetricsCollector {
+            pub(super) fn report(&self) {
+                let metrics = ExecuteMetrics::default();
+                $(
+                    record_execute_metric!(metrics, self, $field $(, $policy)?);
+                )+
+            }
+
+            #[cfg(feature = "test-utils")]
+            fn snapshot(&self) -> BTreeMap<&'static str, usize> {
+                [
+                    $(
+                        (
+                            concat!("grevm.", stringify!($field)),
+                            self.$field.get(),
+                        ),
+                    )+
+                ]
+                .into_iter()
+                .collect()
+            }
+
+        }
+    };
+}
+
+define_execute_metrics! {
+    /// Total transactions.
+    total_tx_cnt;
+    /// Conflict incarnations.
+    conflict_cnt;
+    /// Validation incarnations.
+    validation_cnt;
+    /// Execution incarnations.
+    execution_cnt;
+    /// Validation cursor resets.
+    reset_validation_idx_cnt;
+    /// Dependency updates without work.
+    useless_dependent_update;
+    /// Coinbase conflicts.
+    conflict_by_miner;
+    /// EVM error conflicts.
+    conflict_by_error;
+    /// Estimate read conflicts.
+    conflict_by_estimate;
+    /// Version conflicts.
+    conflict_by_version;
+    /// Transactions completed in one dependency attempt.
+    one_attempt_with_dependency;
+    /// Transactions needing more than two dependency attempts.
+    more_attempts_with_dependency;
+    /// Transactions without dependencies.
+    no_dependency_txs;
+    /// Transactions with at least one conflict.
+    conflict_txs;
+    /// Parallel execution time in nanoseconds.
+    execution_time => skip_zero;
+    /// Commit time in nanoseconds.
+    commit_time;
+    /// Total time in nanoseconds.
+    total_time;
 }
 
 impl ExecuteMetricsCollector {
-    pub(super) fn report(&self) {
-        let metrics = ExecuteMetrics::default();
-        metrics.total_tx_cnt.record(load(&self.total_tx_cnt));
-        metrics.conflict_cnt.record(load(&self.conflict_cnt));
-        metrics.validation_cnt.record(load(&self.validation_cnt));
-        metrics.execution_cnt.record(load(&self.execution_cnt));
-        metrics.reset_validation_idx_cnt.record(load(&self.reset_validation_idx_cnt));
-        metrics.useless_dependent_update.record(load(&self.useless_dependent_update));
-        metrics.conflict_by_miner.record(load(&self.conflict_by_miner));
-        metrics.conflict_by_error.record(load(&self.conflict_by_error));
-        metrics.conflict_by_estimate.record(load(&self.conflict_by_estimate));
-        metrics.conflict_by_version.record(load(&self.conflict_by_version));
-        metrics.one_attempt_with_dependency.record(load(&self.one_attempt_with_dependency));
-        metrics.more_attempts_with_dependency.record(load(&self.more_attempts_with_dependency));
-        metrics.no_dependency_txs.record(load(&self.no_dependency_txs));
-        metrics.conflict_txs.record(load(&self.conflict_txs));
-        let execution_time = self.execution_time.get();
-        if execution_time > 0 {
-            metrics.execution_time.record(execution_time as f64);
+    pub(super) fn dependency_distance_histogram(&self) -> metrics::Histogram {
+        metrics::histogram!("grevm.dependency_distance")
+    }
+
+    #[inline]
+    pub(super) fn record_block_start(&self, total_txs: usize) {
+        self.total_tx_cnt.set(total_txs);
+    }
+
+    #[inline]
+    pub(super) fn record_execution_attempt(&self) {
+        self.execution_cnt.increment();
+    }
+
+    #[inline]
+    pub(super) fn record_validation_attempt(&self) {
+        self.validation_cnt.increment();
+    }
+
+    #[inline]
+    pub(super) fn record_coinbase_conflict(&self) {
+        self.conflict_cnt.increment();
+        self.conflict_by_miner.increment();
+    }
+
+    #[inline]
+    pub(super) fn record_estimate_conflict(&self) {
+        self.conflict_cnt.increment();
+        self.conflict_by_estimate.increment();
+    }
+
+    #[inline]
+    pub(super) fn record_evm_error_conflict(&self) {
+        self.conflict_cnt.increment();
+        self.conflict_by_error.increment();
+    }
+
+    #[inline]
+    pub(super) fn record_version_conflict(&self) {
+        self.conflict_cnt.increment();
+        self.conflict_by_version.increment();
+    }
+
+    #[inline]
+    pub(super) fn record_finalized(&self, incarnation: usize, has_dependency: bool) {
+        if incarnation > 1 {
+            self.conflict_txs.increment();
         }
-        metrics.commit_time.record(load(&self.commit_time));
-        metrics.total_time.record(load(&self.total_time));
+        if has_dependency {
+            if incarnation == 1 {
+                self.one_attempt_with_dependency.increment();
+            } else if incarnation > 2 {
+                self.more_attempts_with_dependency.increment();
+            }
+        } else {
+            self.no_dependency_txs.increment();
+        }
+    }
+
+    #[inline]
+    pub(super) fn record_useless_dependency_update(&self) {
+        self.useless_dependent_update.increment();
+    }
+
+    #[inline]
+    pub(super) fn record_commit_time(&self, elapsed: Duration) {
+        self.commit_time.add(elapsed.as_nanos() as usize);
+    }
+
+    #[inline]
+    pub(super) fn record_execution_time(&self, elapsed: Duration) {
+        self.execution_time.set(elapsed.as_nanos() as usize);
+    }
+
+    #[inline]
+    pub(super) fn record_validation_resets(&self, resets: usize) {
+        self.reset_validation_idx_cnt.set(resets);
+    }
+
+    #[inline]
+    pub(super) fn record_total_time(&self, elapsed: Duration) {
+        self.total_time.set(elapsed.as_nanos() as usize);
     }
 }
 
-fn load(value: &RelaxedUsize) -> f64 {
-    value.get() as f64
+#[cfg(feature = "test-utils")]
+impl<DB: revm::DatabaseRef> super::Scheduler<DB> {
+    pub(crate) fn metrics_snapshot(&self) -> BTreeMap<&'static str, usize> {
+        self.metrics.snapshot()
+    }
+}
+
+#[cfg(all(test, feature = "test-utils"))]
+mod tests {
+    use super::*;
+    use metrics_util::debugging::DebuggingRecorder;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn snapshot_schema_matches_reported_metrics() {
+        let collector = ExecuteMetricsCollector::default();
+        collector.record_block_start(7);
+        // `execution_time` intentionally skips zero values in `report`.
+        collector.record_execution_time(Duration::from_nanos(1));
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || collector.report());
+
+        let reported_names = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(key, _, _, _)| key.key().name().to_owned())
+            .collect::<BTreeSet<_>>();
+        let snapshot = collector.snapshot();
+        let snapshot_names =
+            snapshot.keys().map(|name| (*name).to_owned()).collect::<BTreeSet<_>>();
+
+        assert_eq!(reported_names, snapshot_names);
+        assert_eq!(snapshot["grevm.total_tx_cnt"], 7);
+    }
+
+    #[test]
+    fn conflict_methods_update_total_and_exactly_one_cause() {
+        let collector = ExecuteMetricsCollector::default();
+        collector.record_coinbase_conflict();
+        collector.record_estimate_conflict();
+        collector.record_evm_error_conflict();
+        collector.record_version_conflict();
+
+        let snapshot = collector.snapshot();
+        assert_eq!(snapshot["grevm.conflict_cnt"], 4);
+        assert_eq!(snapshot["grevm.conflict_by_miner"], 1);
+        assert_eq!(snapshot["grevm.conflict_by_estimate"], 1);
+        assert_eq!(snapshot["grevm.conflict_by_error"], 1);
+        assert_eq!(snapshot["grevm.conflict_by_version"], 1);
+    }
+
+    #[test]
+    fn timing_methods_record_nanoseconds() {
+        let collector = ExecuteMetricsCollector::default();
+        collector.record_commit_time(Duration::from_nanos(3));
+        collector.record_execution_time(Duration::from_nanos(5));
+        collector.record_total_time(Duration::from_nanos(7));
+
+        let snapshot = collector.snapshot();
+        assert_eq!(snapshot["grevm.commit_time"], 3);
+        assert_eq!(snapshot["grevm.execution_time"], 5);
+        assert_eq!(snapshot["grevm.total_time"], 7);
+    }
 }

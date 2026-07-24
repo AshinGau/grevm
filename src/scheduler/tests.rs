@@ -25,7 +25,8 @@ fn fatal_execution_abort_uses_recorded_txid_not_finality_idx() {
     });
     scheduler.abort(AbortReason::FatalEvmError(2));
 
-    let error = scheduler.post_execute().expect_err("fatal abort must be returned");
+    let error =
+        scheduler.post_execute(CommittedPrefixEnd::ZERO).expect_err("fatal abort must be returned");
     assert_eq!(scheduler.scheduler_ctx.finality_idx(), 0);
     assert_eq!(error.txid, 2);
     assert!(matches!(
@@ -42,7 +43,9 @@ fn commit_abort_carries_error_without_using_tx_results() {
         error: EVMError::Custom("commit error".to_owned()),
     }));
 
-    let error = scheduler.post_execute().expect_err("commit abort must be returned");
+    let error = scheduler
+        .post_execute(CommittedPrefixEnd::ZERO)
+        .expect_err("commit abort must be returned");
     assert_eq!(error.txid, 1);
     assert!(matches!(
         error.error,
@@ -83,7 +86,9 @@ fn parallel_error_replays_suffix_from_committed_prefix() {
     scheduler
         .abort(AbortReason::ParallelError { txid: 1, message: "test parallel invariant failure" });
 
-    scheduler.post_execute().expect("sequential suffix replay must succeed");
+    scheduler
+        .post_execute(CommittedPrefixEnd::for_test(1))
+        .expect("sequential suffix replay must succeed");
     let results = scheduler.results.lock();
     assert_eq!(results.len(), 2);
     assert!(matches!(results[1], TxExecutionOutcome::Executed(_)));
