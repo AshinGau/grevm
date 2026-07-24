@@ -1,3 +1,9 @@
+//! Block-order finalization of speculative transaction results.
+//!
+//! This stage validates each transaction nonce against the committed prefix, applies its state and
+//! deferred beneficiary reward, then appends its outcome. The scheduler publishes the new committed
+//! boundary only after all three writes complete.
+
 use revm::{DatabaseCommit, DatabaseRef};
 use revm_context::{
     Transaction, TxEnv,
@@ -64,9 +70,9 @@ impl OrderedCommitOutput {
 
 /// Applies finalized transaction state in block order.
 ///
-/// Ordered commit preserves Ethereum-compatible results while keeping deferred miner rewards out of
-/// speculative read/write sets. It runs concurrently with execution and validation, so much of its
-/// work can overlap the speculative pipeline.
+/// Deferring beneficiary rewards keeps the block-wide beneficiary write out of speculative
+/// read/write sets. The committer still applies every transaction's state, reward, and outcome in
+/// block order before the scheduler exposes the new committed prefix.
 pub(crate) struct OrderedCommitter<'a, DB>
 where
     DB: DatabaseRef,
@@ -85,11 +91,10 @@ impl<'a, DB> OrderedCommitter<'a, DB>
 where
     DB: DatabaseRef,
 {
-    /// Construct a committer after preloading the coinbase account.
+    /// Construct a committer after preloading the beneficiary account.
     ///
-    /// Once this succeeds, deferred reward credits cannot need another database lookup. This makes
-    /// a successful [`Self::commit`] atomic with respect to its returned outcome: state and reward
-    /// are both applied before the caller publishes the committed prefix.
+    /// Preloading surfaces a database failure before any ordered state mutation and ensures later
+    /// reward credits use the cached account.
     pub(crate) fn try_new(
         coinbase: Address,
         spec: SpecId,
@@ -98,19 +103,18 @@ where
         disable_nonce_check: bool,
     ) -> Result<Self, DB::Error> {
         let committer = Self { coinbase, spec, basefee, state, disable_nonce_check };
-        // Accesses the coinbase account to ensure proper handling of miner rewards (via
-        // increment_balances) within ParallelState. This preemptive access guarantees correct state
-        // synchronization when applying miner rewards during the final commitment phase.
+        // Reward application must not discover a missing database value after transaction state
+        // has already been committed.
         committer.state.basic_ref(coinbase)?;
         Ok(committer)
     }
 
-    /// Self-compute the miner reward for one transaction, mirroring revm's
+    /// Compute the beneficiary reward for one transaction, mirroring revm's
     /// `post_execution::reward_beneficiary`: from LONDON the basefee is burned and only the
-    /// remainder of the effective gas price reaches the coinbase (EIP-1559).
+    /// remainder of the effective gas price reaches the beneficiary (EIP-1559).
     ///
     /// `result.gas_used()` is exactly the `gas.used()` (post-refund) that revm bills the reward on,
-    /// so this reproduces the forked revm's `lazy_reward` without relying on it.
+    /// so deferred commit reproduces revm's immediate reward calculation.
     fn compute_reward(&self, tx_env: &TxEnv, result: &ExecutionResult) -> u128 {
         let basefee = self.basefee as u128;
         let effective_gas_price = tx_env.effective_gas_price(basefee);
@@ -122,6 +126,11 @@ where
         coinbase_gas_price.saturating_mul(result.gas_used() as u128)
     }
 
+    /// Commit one speculative result at the current ordered boundary.
+    ///
+    /// The caller must provide transactions contiguously in block order and publish the returned
+    /// boundary only after this method succeeds. Nonce validation reads the already committed
+    /// prefix; successful state, beneficiary reward, and outcome writes occur in that order.
     pub(crate) fn commit(
         &mut self,
         txid: TxId,
@@ -129,11 +138,8 @@ where
         result_and_state: ResultAndState,
         output: &mut OrderedCommitOutput,
     ) -> Result<CommitOutcome, GrevmError<DB::Error>> {
-        // During Grevm's execution, transaction nonces are temporarily set to `None` to bypass the
-        // EVM's strict sequential nonce verification. This design enables concurrent transaction
-        // processing without immediate validation failures. However, during the final commitment
-        // phase, the system enforces strict nonce monotonicity checks to guarantee transaction
-        // integrity and prevent double-spending attacks.
+        // Workers retain the original transaction nonce but execute with revm's state nonce check
+        // disabled. Recheck it here against the ordered, committed state.
         let ResultAndState { result, state } = result_and_state;
         if !self.disable_nonce_check {
             match self.state.basic_ref(tx_env.caller) {
@@ -164,20 +170,13 @@ where
                 }
             }
         }
-        // Self-compute the miner reward: upstream revm credits the coinbase inside execution, which
-        // grevm suppresses with `GrevmHandler` in deferred-beneficiary mode and applies
-        // here instead. This reproduces what the dropped `Galxe/revm` fork returned via
-        // `ResultAndState.lazy_reward`.
+        // Deferred-beneficiary execution suppresses revm's immediate credit, so reproduce the
+        // protocol reward at the ordered boundary.
         let reward = self.compute_reward(tx_env, &result);
         self.state.commit(state);
 
-        // In Ethereum, each transaction includes a miner reward, which would introduce write
-        // conflicts in the read-write set if implemented naively, preventing parallel transaction
-        // execution. Grevm adopts an optimized approach: it defers miner reward distribution until
-        // the transaction commitment phase rather than during execution. This design ensures
-        // correct concurrency - even if subsequent transactions access the miner's account, they
-        // will read the proper miner state from ParallelState (verified via commit_idx) without
-        // creating artificial dependencies.
+        // Deferral removes the ubiquitous beneficiary write conflict from speculation. Transactions
+        // that need committed-origin data are separately gated by the scheduler's committed prefix.
         let coinbase = self.coinbase;
         self.state
             .increment_balances([(coinbase, reward)])
@@ -378,7 +377,7 @@ mod tests {
         let tx_env = TxEnv { gas_price: 100, gas_limit: gas_used, ..Default::default() };
         let basefee = 10u64;
 
-        // Pre-LONDON: full price to coinbase, basefee NOT subtracted.
+        // Pre-LONDON: full price reaches the beneficiary; basefee is not subtracted.
         {
             let (_, commit_state) = state.split_for_parallel();
             let pre = OrderedCommitter::try_new(
@@ -392,7 +391,7 @@ mod tests {
             assert_eq!(pre.compute_reward(&tx_env, &result), 100u128 * gas_used as u128);
         }
 
-        // LONDON+: basefee burned, only the priority portion reaches the coinbase.
+        // LONDON+: basefee is burned; only the priority portion reaches the beneficiary.
         let (_, commit_state) = state.split_for_parallel();
         let post =
             OrderedCommitter::try_new(Address::ZERO, SpecId::LONDON, basefee, commit_state, true)

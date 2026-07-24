@@ -36,7 +36,6 @@ fn bench_continuous(c: &mut Criterion) {
         execute::compare_evm_execute_with_env(
             block.db.clone(),
             block.txs.clone(),
-            false,
             block.cfg.clone(),
             block.block_env.clone(),
             Default::default(),

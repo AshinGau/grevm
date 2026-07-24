@@ -134,6 +134,10 @@ impl ExecutionFrontier {
 }
 
 /// Lock-free cursors and logical timestamps used by the scheduling state machine.
+///
+/// `validation` is the next validation claim and may rewind. `finality` and `committed` are
+/// monotonic exclusive ends of the contiguous validated and ordered-commit prefixes,
+/// respectively. `execution_frontier` is the first transaction without an initial execution.
 pub(super) struct SchedulerContext {
     num_txs: usize,
     validation: RewindableCursor,
@@ -165,6 +169,9 @@ impl SchedulerContext {
         if index >= self.num_txs {
             return;
         }
+        // Publish invalidation before making the index claimable. Finality advances contiguously
+        // and checks status plus this timestamp under transaction locks, so a validation predating
+        // this rewind cannot enter the stable prefix afterward.
         let timestamp = self.logical_clock.next();
         self.lower_timestamps[index].record(timestamp);
         let previous = self.validation.rewind(index);

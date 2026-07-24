@@ -21,9 +21,18 @@ struct ProcessedTransition {
     account: Option<ProcessedAccount>,
 }
 
-/// Parallel transition application for an initially empty bundle.
+/// Parallel transition application for an initially empty [`BundleState`].
+///
+/// The implementation has two phases: it derives immutable per-account bundle/revert data in
+/// parallel, then updates the destination maps and accounting fields serially. Keeping mutation
+/// in the second phase avoids aliased access to the bundle while preserving revm's transition
+/// order and accounting semantics.
 pub trait ParallelBundleState {
-    /// Apply transitions and create reverts in parallel.
+    /// Applies transitions and creates reverts, using parallel preparation when `self` is empty.
+    ///
+    /// If `self` already contains state, contracts, or reverts, this delegates to revm's canonical
+    /// occupied-entry merge because existing entries may need to be combined with the new
+    /// transitions.
     fn parallel_apply_transitions_and_create_reverts(
         &mut self,
         transitions: TransitionState,
@@ -45,6 +54,8 @@ impl ParallelBundleState for BundleState {
         let include_reverts = retention.includes_reverts();
         let transitions: Vec<_> = transitions.transitions.into_iter().collect();
         let transition_count = transitions.len();
+        // This phase is pure with respect to `self`; each transition produces an independent
+        // value that can be prepared safely on any Rayon worker.
         let processed: Vec<_> = transitions
             .into_par_iter()
             .map(|(address, transition)| {
@@ -73,6 +84,8 @@ impl ParallelBundleState for BundleState {
         let revert_capacity = if include_reverts { transition_count } else { 0 };
         let mut reverts = Vec::with_capacity(revert_capacity);
         self.state.reserve(transition_count);
+        // Mutate the bundle only after parallel preparation has finished. `collect` preserves the
+        // indexed input order, so this phase matches the transition order used by revm.
         for ProcessedTransition { contract, account } in processed {
             if let Some((hash, code)) = contract {
                 self.contracts.insert(hash, code);
@@ -95,15 +108,21 @@ impl ParallelBundleState for BundleState {
 /// Kept as a compatibility extension trait. New code should call
 /// [`ParallelState::finalize_bundle`] directly.
 pub trait ParallelTakeBundle {
-    /// Take the accumulated bundle using parallel transition application.
+    /// Finalizes pending transitions and takes the accumulated bundle.
+    ///
+    /// This has the same destructive semantics as [`ParallelState::finalize_bundle`]: pending
+    /// transitions are drained and the returned bundle is replaced by an empty bundle in
+    /// `ParallelState`.
     fn parallel_take_bundle(&mut self, retention: BundleRetention) -> BundleState;
 }
 
 impl<DB: DatabaseRef> ParallelState<DB> {
     /// Merge all pending transitions and take the finalized block bundle.
     ///
-    /// An initially empty bundle uses parallel transition preparation. Existing bundle data
-    /// automatically falls back to revm's ordered merge semantics.
+    /// Pending transitions are drained before this method returns. An initially empty bundle uses
+    /// parallel transition preparation followed by a serial merge; existing bundle data
+    /// automatically falls back to revm's canonical merge semantics. Finally, the accumulated
+    /// bundle is taken from `self`, leaving its bundle state empty.
     #[must_use]
     pub fn finalize_bundle(&mut self, retention: BundleRetention) -> BundleState {
         if let Some(transitions) = self.transition_state.as_mut().map(TransitionState::take) {

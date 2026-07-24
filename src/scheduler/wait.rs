@@ -1,3 +1,9 @@
+//! Predicate-based notification for scheduler coordinator threads.
+//!
+//! The caller's predicate is authoritative; notifications are deliberately coalesced and only
+//! prompt another predicate check. Bounded parking supports stall diagnostics without turning a
+//! timeout into scheduler state.
+
 use std::{
     sync::{
         OnceLock,
@@ -127,7 +133,8 @@ where
 ///
 /// The consumer moves `IDLE -> ARMED`, rechecks its predicate, and only then moves
 /// `ARMED -> PARKED`. A notification observed in `ARMED` cancels the pending wait without leaving
-/// an `unpark` token; a notification observed in `PARKED` wakes the sleeping thread.
+/// an `unpark` token; a notification observed in `PARKED` wakes the sleeping thread. This
+/// predicate protocol prevents a state change between checking and parking from being lost.
 #[derive(Debug)]
 pub(super) struct WaitSlot {
     thread: OnceLock<Thread>,

@@ -887,15 +887,11 @@ impl<DB: DatabaseRef> ParallelState<DB> {
     }
 
     // TODO make cache aware of transitions dropping by having global transition counter.
-    /// Takes the [`BundleState`] changeset from the [`State`], replacing it
-    /// with an empty one.
+    /// Takes the accumulated [`BundleState`], replacing it with an empty one.
     ///
-    /// This will not apply any pending [`TransitionState`]. It is recommended
-    /// to call [`State::merge_transitions`] before taking the bundle.
-    ///
-    /// If the `State` has been built with the
-    /// [`StateBuilder::with_bundle_prestate`] option, the pre-state will be
-    /// taken along with any changes made by [`State::merge_transitions`].
+    /// This is a low-level, destructive operation: it does not apply or drain a pending
+    /// [`TransitionState`]. Call [`Self::finalize_bundle`] when producing a finalized block
+    /// bundle; use this method directly only after transitions have already been merged.
     pub fn take_bundle(&mut self) -> BundleState {
         core::mem::take(&mut self.bundle_state)
     }

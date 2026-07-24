@@ -1,3 +1,10 @@
+//! Per-block execution metrics.
+//!
+//! The collector accumulates scheduler events during one execution lifecycle and reports them when
+//! that lifecycle ends. Parallel runs record `execution_time` when the finality loop exits;
+//! `commit_time` sums ordered-commit calls, and `total_time` covers the complete lifecycle,
+//! including sequential recovery.
+
 use crate::atomic::RelaxedUsize;
 use metrics_derive::Metrics;
 #[cfg(feature = "test-utils")]
@@ -87,7 +94,9 @@ define_execute_metrics! {
     reset_validation_idx_cnt;
     /// Dependency updates without work.
     useless_dependent_update;
-    /// Coinbase conflicts.
+    /// Reads requiring committed origin state.
+    ///
+    /// The `conflict_by_miner` metric name is retained for compatibility.
     conflict_by_miner;
     /// EVM error conflicts.
     conflict_by_error;

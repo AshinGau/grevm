@@ -126,21 +126,13 @@ pub fn compare_execution_result(left: &[ExecutionResult], right: &[TxExecutionOu
 pub fn compare_evm_execute<DB>(
     db: DB,
     txs: Vec<TxEnv>,
-    legacy_with_hints: bool,
     disable_nonce_check: bool,
     parallel_metrics: HashMap<&str, usize>,
 ) where
     DB: DatabaseRef + Send + Sync + Debug,
     DB::Error: Send + Sync + Clone + Debug + 'static,
 {
-    compare_evm_execute_with_spec(
-        db,
-        txs,
-        legacy_with_hints,
-        disable_nonce_check,
-        parallel_metrics,
-        SpecId::SHANGHAI,
-    );
+    compare_evm_execute_with_spec(db, txs, disable_nonce_check, parallel_metrics, SpecId::SHANGHAI);
 }
 
 /// Same as [`compare_evm_execute`] but lets the caller pick the [`SpecId`]. Needed for
@@ -148,7 +140,6 @@ pub fn compare_evm_execute<DB>(
 pub fn compare_evm_execute_with_spec<DB>(
     db: DB,
     txs: Vec<TxEnv>,
-    legacy_with_hints: bool,
     disable_nonce_check: bool,
     parallel_metrics: HashMap<&str, usize>,
     spec: SpecId,
@@ -160,7 +151,7 @@ pub fn compare_evm_execute_with_spec<DB>(
     let mut cfg = CfgEnv::new_with_spec(spec);
     cfg.disable_nonce_check = disable_nonce_check;
     // Synthetic blocks are constructed to always execute, so a sequential failure is itself a bug.
-    match compare_evm_execute_with_env(db, txs, legacy_with_hints, cfg, env, parallel_metrics) {
+    match compare_evm_execute_with_env(db, txs, cfg, env, parallel_metrics) {
         ReplayOutcome::Ok { .. } => {}
         ReplayOutcome::SequentialFailed(e) => panic!("sequential reference execution failed: {e}"),
     }
@@ -175,7 +166,6 @@ pub fn compare_evm_execute_with_spec<DB>(
 pub fn compare_evm_execute_skipping_invalid_with_spec<DB>(
     db: DB,
     txs: Vec<TxEnv>,
-    legacy_with_hints: bool,
     spec: SpecId,
 ) -> Vec<TxExecutionOutcome>
 where
@@ -192,7 +182,6 @@ where
             .unwrap_or_else(|error| panic!("sequential skip reference failed: {error:?}"));
 
     let state = ParallelState::new(db, true, true);
-    let _ = legacy_with_hints;
     let scheduler =
         Scheduler::new_with_runtime_config(cfg, env, txs, state, None, revm_compatibility_config());
     scheduler.parallel_execute(Some(23)).expect("parallel execute failed");
@@ -228,7 +217,6 @@ pub enum ReplayOutcome {
 pub fn compare_evm_execute_with_env<DB>(
     db: DB,
     txs: Vec<TxEnv>,
-    legacy_with_hints: bool,
     cfg: CfgEnv,
     env: BlockEnv,
     parallel_metrics: HashMap<&str, usize>,
@@ -256,7 +244,6 @@ where
         std::env::var_os("GREVM_PRINT_METRICS").is_some().then(metrics_snapshotter).flatten();
     let start = Instant::now();
     let state = ParallelState::new(db.clone(), true, true);
-    let _ = legacy_with_hints;
     let executor = Scheduler::new_with_runtime_config(
         cfg.clone(),
         env.clone(),

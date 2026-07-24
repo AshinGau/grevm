@@ -29,6 +29,9 @@ impl ExecutionPhase {
 }
 
 /// One-shot lifecycle shared by every public execution entry point.
+///
+/// Dropping the execution permit completes the lifecycle after success, error, or unwinding, so a
+/// scheduler can never be restarted with partially consumed state.
 #[derive(Debug)]
 pub(super) struct ExecutionLifecycle(AtomicU8);
 
@@ -66,9 +69,9 @@ where
 {
     /// Take the ordered transaction outcomes and the corresponding `ParallelState`.
     ///
-    /// Before execution this returns an empty outcome list and the untouched state. After an
-    /// execution error it returns the successfully committed prefix only; the state and outcomes
-    /// always describe the same prefix.
+    /// Before execution this returns an empty outcome list and untouched state. After an error it
+    /// returns the successfully committed prefix; state and outcomes always describe that same
+    /// prefix.
     #[must_use]
     pub fn take_result_and_state(self) -> (Vec<TxExecutionOutcome>, ParallelState<DB>) {
         (self.results.into_inner(), self.state.into_inner())
@@ -78,7 +81,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error if this scheduler has already started through any execution entry point.
+    /// Returns an error if this scheduler has already started, or if execution encounters a
+    /// database, fatal EVM, or scheduler invariant error. Invalid transactions are skipped.
     pub fn execute(&self) -> Result<(), GrevmError<DB::Error>> {
         self.parallel_execute(None)
     }
@@ -90,7 +94,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error if this scheduler has already started through any execution entry point.
+    /// Returns an error if this scheduler has already started, or if execution encounters a
+    /// database, fatal EVM, or scheduler invariant error. Invalid transactions are skipped.
     ///
     /// # Panics
     ///
@@ -133,6 +138,8 @@ where
         &self,
         committed: CommittedPrefixEnd,
     ) -> Result<(), GrevmError<DB::Error>> {
+        // `committed` is the authoritative committed boundary. Abort metadata selects whether the
+        // remaining suffix is replayed or an unrecoverable error is returned.
         if self.is_aborted() {
             match self.abort_reason.get() {
                 Some(AbortReason::FatalEvmError(txid)) => {
@@ -176,6 +183,8 @@ where
     }
 
     pub(super) fn abort(&self, abort_reason: AbortReason<DB::Error>) {
+        // Preserve the first abort cause. Publish it before the release-store so acquire readers
+        // that observe `abort` can also observe the reason.
         self.abort_reason.get_or_init(|| abort_reason);
         self.abort.store(true, Ordering::Release);
         self.finality_wait.notify();

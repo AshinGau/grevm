@@ -7,8 +7,9 @@
 //!
 //! ## Concurrency
 //!
-//! Grevm automatically determines the optimal level of concurrency based on the available CPU
-//! cores. Integrations can override it through [`GrevmConfig::concurrency_level`].
+//! By default, Grevm creates one speculative worker per logical CPU reported by
+//! [`std::thread::available_parallelism`] (falling back to eight if it is unavailable).
+//! Integrations can override the worker count through [`GrevmConfig::concurrency_level`].
 //!
 //! ## Error Handling
 //!

@@ -11,7 +11,7 @@ use grevm::test_utils::{
         erc20_contract::ERC20Token, generate_cluster, generate_cluster_and_txs,
     },
 };
-use revm::primitives::{U256, uint};
+use revm::primitives::U256;
 use revm_context::TxEnv;
 use revm_primitives::{HashMap, TxKind};
 
@@ -43,7 +43,6 @@ fn erc20_gigagas() {
     execute::compare_evm_execute(
         db,
         txs,
-        true,
         false,
         [
             ("grevm.total_tx_cnt", block_size),
@@ -55,66 +54,6 @@ fn erc20_gigagas() {
         .into_iter()
         .collect(),
     );
-}
-
-#[test]
-fn legacy_hint_flag_does_not_change_execution_correctness() {
-    let account1 = account::mock_eoa_address(1);
-    let account2 = account::mock_eoa_address(2);
-    let account3 = account::mock_eoa_address(3);
-    let account4 = account::mock_eoa_address(4);
-    let mut accounts = account::mock_block_accounts(4);
-    let mut bytecodes = HashMap::default();
-    let contract_address = account::mock_eoa_address(0);
-    let galxe_account =
-        ERC20Token::new("Galxe Token", "G", 18, 222_222_000_000_000_000_000_000u128)
-            .add_balances(
-                &[account1, account2, account3, account4],
-                uint!(1_000_000_000_000_000_000_U256),
-            )
-            .add_allowances(&[account1], account2, uint!(50_000_000_000_000_000_U256))
-            .build();
-    bytecodes.insert(galxe_account.info.code_hash, galxe_account.info.code.clone().unwrap());
-    accounts.insert(contract_address, galxe_account);
-    // tx0: account1 --(erc20)--> account4
-    // tx1: account2 --(erc20)--> account4
-    // tx2: account3 --(raw)--> account4
-    // so, (tx0, tx1) are independent with (tx2)
-    let mut txs: Vec<TxEnv> = vec![
-        TxEnv {
-            caller: account1,
-            kind: TxKind::Call(contract_address),
-            value: U256::from(0),
-            gas_limit: GAS_LIMIT,
-            gas_price: 1,
-            nonce: 1,
-            ..TxEnv::default()
-        },
-        TxEnv {
-            caller: account2,
-            kind: TxKind::Call(contract_address),
-            value: U256::from(0),
-            gas_limit: GAS_LIMIT,
-            gas_price: 1,
-            nonce: 1,
-            ..TxEnv::default()
-        },
-        TxEnv {
-            caller: account3,
-            kind: TxKind::Call(account4),
-            value: U256::from(100),
-            gas_limit: GAS_LIMIT,
-            gas_price: 1,
-            nonce: 1,
-            ..TxEnv::default()
-        },
-    ];
-    let call_data = ERC20Token::transfer(account4, U256::from(900));
-    txs[0].data = call_data.clone();
-    txs[1].data = call_data.clone();
-    let db = InMemoryDB::new(accounts, bytecodes, Default::default());
-    execute::compare_evm_execute(db.clone(), txs.clone(), false, false, Default::default());
-    execute::compare_evm_execute(db, txs, true, false, Default::default());
 }
 
 #[test]
@@ -133,7 +72,7 @@ fn erc20_independent() {
     let miner = account::mock_miner_account();
     state.insert(miner.0, miner.1);
     let db = InMemoryDB::new(state, bytecodes, Default::default());
-    execute::compare_evm_execute(db, txs, true, false, Default::default());
+    execute::compare_evm_execute(db, txs, false, Default::default());
 }
 
 #[test]
@@ -161,5 +100,5 @@ fn erc20_batch_transfer() {
     }
 
     let db = InMemoryDB::new(final_state, final_bytecodes, Default::default());
-    execute::compare_evm_execute(db, final_txs, true, false, Default::default());
+    execute::compare_evm_execute(db, final_txs, false, Default::default());
 }

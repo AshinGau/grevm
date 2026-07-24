@@ -66,6 +66,31 @@ rust.missing_debug_implementations = "warn"
 rust.missing_docs = "warn"
 rust.unreachable_pub = "warn"
 
+# End-to-end tests share the feature-gated fixture and comparison utilities.
+[[test]]
+name = "delegated_safety"
+required-features = ["test-utils"]
+
+[[test]]
+name = "eip-7702"
+required-features = ["test-utils"]
+
+[[test]]
+name = "erc20"
+required-features = ["test-utils"]
+
+[[test]]
+name = "mainnet"
+required-features = ["test-utils"]
+
+[[test]]
+name = "native_transfers"
+required-features = ["test-utils"]
+
+[[test]]
+name = "uniswap"
+required-features = ["test-utils"]
+
 [[bench]]
 name = "gigagas"
 harness = false
@@ -113,7 +138,7 @@ lto = "off"
 
 [features]
 test-utils = ["metrics-util", "dep:serde", "dep:serde_json", "revm-primitives/serde"]
-# Mainnet fetcher binaries (`fetch_block`, `fetch_continuous`): pulls in the test-utils fixture
-# schema plus a blocking HTTP client. Kept separate from `test-utils` so the test/bench path
-# doesn't drag in `ureq`.
+# Mainnet RPC tools (`fetch_block`, `fetch_continuous`, `replay_mainnet`): pull in the test-utils
+# fixture schema plus a blocking HTTP client. Kept separate from `test-utils` so the test/bench
+# path doesn't drag in `ureq`.
 tools = ["test-utils", "dep:ureq"]

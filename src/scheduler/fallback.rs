@@ -1,4 +1,8 @@
 //! Sequential suffix replay used for configured and recovery fallbacks.
+//!
+//! Replay starts at an exclusive committed boundary. State and outcomes must represent exactly that
+//! prefix; successful and invalid transactions extend it, while a fatal error preserves the
+//! completed portion for the caller.
 
 use super::{Scheduler, executor::build_evm, ordered_commit::CommittedPrefixEnd};
 use crate::{
@@ -41,7 +45,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error if this scheduler has already started through any execution entry point.
+    /// Returns an error if this scheduler has already started, or if replay encounters a database
+    /// or fatal EVM error. Invalid transactions are recorded as skipped outcomes.
     pub fn fallback_sequential(&self) -> Result<(), GrevmError<DB::Error>> {
         let _execution = self.begin_execution()?;
         self.run_measured(|_| self.replay_uncommitted_suffix(CommittedPrefixEnd::ZERO))
@@ -53,6 +58,8 @@ where
     ) -> Result<(), GrevmError<DB::Error>> {
         let start = committed.index();
         let result_count = self.results.lock().len();
+        // State is already committed through `start`; outcomes must name the identical prefix
+        // before replay can safely append the suffix.
         if start > self.block_size || result_count != start {
             return Err(GrevmError {
                 txid: start.min(self.block_size.saturating_sub(1)),
@@ -77,8 +84,8 @@ where
                 self.config.delegated_safety.forbid_delegated_create,
             );
             let mut evm = evm;
-            // The planner describes the original full block, so suffix replay must keep global
-            // TxIds. `start` must not rebase future-cost lookups.
+            // The planner describes the full block, so replay retains global TxIds rather than
+            // rebasing future-cost lookups at `start`.
             self.execute_sequential_suffix(start, |txid, tx| {
                 reject_nonce_overflow(evm.db_mut(), self.cfg.disable_nonce_check, tx)?;
                 evm.ctx.set_tx(tx.clone());
@@ -132,6 +139,8 @@ fn reject_nonce_overflow<DB: DatabaseRef>(
     disable_nonce_check: bool,
     tx: &TxEnv,
 ) -> Result<(), EVMError<DB::Error>> {
+    // revm increments the sender nonce with saturating arithmetic. Detect MAX explicitly so
+    // sequential recovery preserves the protocol's nonce-overflow invalid classification.
     if !disable_nonce_check &&
         tx.nonce == u64::MAX &&
         db.basic_ref(tx.caller)?.map_or(0, |info| info.nonce) == u64::MAX
@@ -169,7 +178,6 @@ mod tests {
             BlockEnv::default(),
             Arc::new(vec![TxEnv::default(); num_txs]),
             ParallelState::new(EmptyDB::default(), true, false),
-            false,
             None,
         )
     }

@@ -18,7 +18,7 @@ pub struct GrevmConfig {
 }
 
 impl GrevmConfig {
-    /// Builds the legacy grevm runtime configuration from environment variables.
+    /// Builds the Grevm runtime configuration from environment variables.
     pub fn from_env() -> Self {
         let defaults = Self::default();
         Self {

@@ -2,11 +2,20 @@
 ///
 /// The switches are independent because delegated CREATE changes an EOA's nonce, while the
 /// balance guard handles value movement that admission filtering cannot see without execution.
+/// Both are opt-in and disabled by [`Default`], preserving upstream revm behavior.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DelegatedSafetyConfig {
-    /// Rejects CREATE and CREATE2 in an EIP-7702 delegated account's execution context.
+    /// Halts CREATE and CREATE2 in an EIP-7702 delegated account's execution context with
+    /// `NotActivated`.
+    ///
+    /// For a top-level delegated call this is reported as a
+    /// [`revm_context::result::ExecutionResult::Halt`].
     pub forbid_delegated_create: bool,
-    /// Prevents delegated execution from consuming funds needed by later transactions.
+    /// Prevents delegated execution from consuming funds reserved for later transactions.
+    ///
+    /// A violation rolls back execution state and returns a charged top-level
+    /// [`revm_context::result::ExecutionResult::Revert`]. The gas charge, transaction nonce, and
+    /// EIP-7702 authorization effects remain applied.
     pub reserve_delegated_balance: bool,
 }
 

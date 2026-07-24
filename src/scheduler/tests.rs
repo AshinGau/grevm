@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "test-utils")]
+use crate::DelegatedSafetyConfig;
 use crate::InvalidTransaction;
 use revm_context::{
     DBErrorMarker,
@@ -55,7 +57,6 @@ fn empty_scheduler(num_txs: usize) -> Scheduler<EmptyDB> {
         BlockEnv::default(),
         Arc::new(vec![TxEnv::default(); num_txs]),
         ParallelState::new(EmptyDB::default(), true, false),
-        false,
         None,
     )
 }
@@ -114,6 +115,29 @@ fn concurrent_fallback_and_execute_have_exactly_one_winner() {
         loser.error,
         EVMError::Custom(message) if message.contains("can execute only once")
     ));
+}
+
+#[test]
+fn duplicate_claim_does_not_release_dependents_before_execution_starts() {
+    let scheduler = empty_scheduler(2);
+
+    assert_eq!(scheduler.tx_dependency.next(), Some(0));
+    assert!(matches!(scheduler.execution_task(0), Some(Task::Execution(_))));
+    assert_eq!(scheduler.tx_dependency.next(), Some(1));
+
+    // Requeue transaction 0 as a predecessor while its owning worker is between creating the
+    // execution task and entering `execute_task`.
+    scheduler.tx_dependency.add(1, Some(0));
+    assert_eq!(scheduler.tx_dependency.next(), Some(0));
+    assert!(scheduler.execution_task(0).is_none());
+    assert_eq!(
+        scheduler.tx_dependency.next(),
+        None,
+        "the duplicate claim must leave transaction 1 blocked"
+    );
+
+    scheduler.tx_dependency.remove(0, false);
+    assert_eq!(scheduler.tx_dependency.next(), Some(1));
 }
 
 #[test]
@@ -190,7 +214,6 @@ fn ordered_commit_database_error_aborts_and_returns_exact_error() {
         BlockEnv { beneficiary: coinbase, ..Default::default() },
         Arc::new(vec![tx]),
         ParallelState::new(CommitFailDb { coinbase }, true, false),
-        false,
         None,
     );
     *scheduler.tx_results[0].lock() = Some(TransactionResult {
@@ -243,7 +266,6 @@ fn ordered_commit_error_retains_the_successful_prefix() {
         BlockEnv { beneficiary: coinbase, ..Default::default() },
         txs,
         ParallelState::new(CommitFailDb { coinbase }, true, false),
-        false,
         None,
     );
     for tx_result in &scheduler.tx_results {
@@ -352,7 +374,6 @@ fn parallel_error_replays_suffix_from_committed_prefix() {
         BlockEnv::default(),
         Arc::new(vec![TxEnv::default(), suffix_tx]),
         state,
-        false,
         None,
     );
     scheduler

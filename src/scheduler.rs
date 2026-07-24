@@ -1,3 +1,11 @@
+//! Parallel Block-STM orchestration.
+//!
+//! Workers speculatively execute and validate transactions. A dedicated finality loop publishes a
+//! contiguous, freshly validated prefix, and ordered commit applies that prefix before publishing
+//! the committed boundary. Dependency edges only prioritize work; read-set validation preserves
+//! correctness. If parallel execution cannot continue, the uncommitted suffix is replayed
+//! sequentially from the committed state.
+
 mod context;
 mod control;
 mod executor;
@@ -11,9 +19,7 @@ mod wait;
 use crate::{
     AbortReason, GrevmConfig, GrevmError, LocationAndType, MVMemory, ParallelState, ReadVersion,
     Task, TransactionResult, TransactionStatus, TxExecutionOutcome, TxId, TxState, TxVersion,
-    cache_db::CacheDB,
-    delegated_safety::{DelegatedSafetyConfig, ReservePlanner},
-    tx_dependency::TxDependency,
+    cache_db::CacheDB, delegated_safety::ReservePlanner, tx_dependency::TxDependency,
 };
 use ahash::{AHashMap as HashMap, AHashSet as HashSet};
 use alloy_evm::precompiles::DynPrecompile;
@@ -43,9 +49,7 @@ struct CommitLoopResult<DBError> {
     error: Option<GrevmError<DBError>>,
 }
 
-/// The `Scheduler` struct is responsible for managing the parallel execution of transactions
-/// in a block. It coordinates the execution, validation, and finalization of transactions
-/// while handling dependencies and conflicts between them.
+/// Coordinates speculative execution, validation, finality, and ordered commit for one block.
 ///
 /// # Type Parameters
 /// - `DB`: A type that implements the `DatabaseRef` trait, representing the database used for
@@ -97,19 +101,14 @@ where
     DB: DatabaseRef + Send + Sync,
     DB::Error: Clone + Send + Sync + 'static,
 {
-    /// Create a scheduler using the legacy environment-based runtime configuration.
-    ///
-    /// `legacy_with_hints` is retained for source compatibility and ignored. Static hint inference
-    /// has been removed; dependencies are discovered from speculative reads and writes.
+    /// Create a scheduler using the environment-based runtime configuration.
     pub fn new(
         cfg: CfgEnv,
         env: BlockEnv,
         txs: Arc<Vec<TxEnv>>,
         state: ParallelState<DB>,
-        legacy_with_hints: bool,
         custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
     ) -> Self {
-        let _ = legacy_with_hints;
         Self::new_with_runtime_config(
             cfg,
             env,
@@ -135,45 +134,6 @@ where
     ) -> Self {
         assert!(config.concurrency_level > 0, "grevm concurrency level must be greater than zero");
         Self::build(cfg, env, txs, state, custom_precompiles, config)
-    }
-
-    /// Compatibility constructor retaining the legacy static-hints argument.
-    ///
-    /// `legacy_with_hints` is retained for source compatibility. Static hint inference was removed;
-    /// dependencies are discovered from speculative reads and writes during execution.
-    pub fn new_with_config(
-        cfg: CfgEnv,
-        env: BlockEnv,
-        txs: Arc<Vec<TxEnv>>,
-        state: ParallelState<DB>,
-        legacy_with_hints: bool,
-        custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
-        config: GrevmConfig,
-    ) -> Self {
-        let _ = legacy_with_hints;
-        Self::new_with_runtime_config(cfg, env, txs, state, custom_precompiles, config)
-    }
-
-    /// Compatibility constructor for callers that only override delegated-account safety.
-    #[deprecated(note = "use Scheduler::new_with_runtime_config and GrevmConfig")]
-    pub fn new_with_delegated_safety(
-        cfg: CfgEnv,
-        env: BlockEnv,
-        txs: Arc<Vec<TxEnv>>,
-        state: ParallelState<DB>,
-        legacy_with_hints: bool,
-        custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
-        delegated_safety: DelegatedSafetyConfig,
-    ) -> Self {
-        let _ = legacy_with_hints;
-        Self::new_with_runtime_config(
-            cfg,
-            env,
-            txs,
-            state,
-            custom_precompiles,
-            GrevmConfig::from_env().with_delegated_safety(delegated_safety),
-        )
     }
 
     fn build(
@@ -215,6 +175,10 @@ where
         }
     }
 
+    /// Advance the exclusive end of the contiguous stable prefix.
+    ///
+    /// A transaction becomes final only while it is `Unconfirmed` and its validation timestamp is
+    /// newer than every validation rewind affecting this prefix. Finality never skips an index.
     fn run_finality_loop(&self) {
         self.finality_wait.register_current_thread();
         let mut last_progress = Instant::now();
@@ -283,17 +247,26 @@ where
         if finality_idx >= self.block_size || finality_idx >= self.scheduler_ctx.validation_idx() {
             return None;
         }
+        // Read the validation frontier first, then decide status and timestamp eligibility under
+        // the transaction lock. Together with contiguous finality, this prevents a candidate from
+        // passing a rewind that invalidates it or an earlier transaction.
         let tx_state = self.tx_states[finality_idx].lock();
         if tx_state.status != TransactionStatus::Unconfirmed {
             return None;
         }
 
-        // Rolling back validation makes this and every later finality timestamp logically newer.
+        // Carry the largest rewind timestamp through the contiguous prefix: every later candidate
+        // must have been validated after that rewind as well.
         let effective_lower_ts = max(lower_ts, self.scheduler_ctx.lower_timestamp(finality_idx));
         (self.scheduler_ctx.unconfirmed_timestamp(finality_idx) > effective_lower_ts)
             .then_some((tx_state, effective_lower_ts))
     }
 
+    /// Commit finalized transactions strictly in block order.
+    ///
+    /// `commit_idx`, the ordered output end, and the published committed cursor describe the same
+    /// exclusive prefix. `OrderedCommitter::commit` applies state, beneficiary rewards, and the
+    /// outcome before this loop publishes that prefix.
     fn run_commit_loop(&self, committer: &mut OrderedCommitter<DB>) -> CommitLoopResult<DB::Error> {
         self.commit_wait.register_current_thread();
         let mut output = OrderedCommitOutput::with_capacity(self.block_size);
@@ -326,6 +299,7 @@ where
                     Ok(CommitOutcome::Committed(committed)) => {
                         let next_commit_idx = committed.index();
                         self.scheduler_ctx.publish_commit(next_commit_idx);
+                        // Publish committed state before releasing work that may require it.
                         self.tx_dependency.commit(commit_idx);
                         commit_idx = next_commit_idx;
                     }
@@ -358,6 +332,8 @@ where
         &self,
         result: CommitLoopResult<DB::Error>,
     ) -> Result<CommittedPrefixEnd, GrevmError<DB::Error>> {
+        // Preserve the successfully committed prefix even when the commit loop ended with an
+        // error; sequential recovery and callers must observe the same state/outcome boundary.
         let CommitLoopResult { committed: output, error } = result;
         let committed = output.end();
         assert_eq!(
@@ -381,9 +357,10 @@ where
             return self.replay_uncommitted_suffix(CommittedPrefixEnd::ZERO);
         }
         let commit_thread_result = {
-            // This lock protects Scheduler's block-level ownership, not transaction processing. It
-            // is acquired once and held while safe, disjoint field borrows are used by workers and
-            // ordered commit.
+            // Spawn `concurrency_level` speculative workers plus one finality coordinator and one
+            // ordered commit thread. Workers and commit share the concurrent cache/database view;
+            // transition aggregation remains exclusively owned by commit. The scoped join ends
+            // every borrow before sequential recovery can access the state again.
             let mut state = self.state.lock();
             let (state_view, commit_state) = state.split_for_parallel();
             let mut committer = OrderedCommitter::try_new(
@@ -430,17 +407,15 @@ where
             })
         };
         let committed = self.install_commit_loop_result(commit_thread_result)?;
-        // Return error if execution failed
+        // Recover or replay from the authoritative committed boundary recorded above.
         self.post_execute(committed)?;
         Ok(())
     }
 
-    /// After execution, transactions are marked as conflict status in three scenarios:
-    /// ​- EVM Execution Failure: The transaction fails during EVM processing
-    /// - ​Read Estimate Data: The transaction accesses uncommitted state estimates
-    /// - ​Unconfirmed Miner/Self-Destruct Accounts: The transaction interacts with miner rewards or
-    ///   self-destructed accounts before their committing transaction is finalized (txid ≠
-    ///   commit_idx)
+    /// Run execution and validation tasks until the scheduler finishes or aborts.
+    ///
+    /// Estimate reads and reads requiring committed-origin state are rescheduled. EVM errors wait
+    /// for committed state when possible, or trigger fallback/abort at the commit head.
     fn run_worker<'db, WorkerDB>(
         &self,
         executor: &mut impl ParallelTransactionExecutor<'db, WorkerDB>,
@@ -469,6 +444,8 @@ where
     {
         let TxVersion { txid, incarnation } = tx_version.clone();
         let mut tx_state = self.tx_states[txid].lock();
+        // Cursor claims are advisory and may become stale after a rewind. The locked status and
+        // incarnation are the authority for whether this task may execute.
         if tx_state.status != TransactionStatus::Executing {
             return None;
         }
@@ -485,20 +462,16 @@ where
         let commit_idx = self.scheduler_ctx.committed_idx();
         let result = executor.transact(tx_version, tx_env);
 
-        // The `​write_new_locations` mechanism optimizes validation by intelligently reducing
-        // redundant verification tasks. Under standard validation logic, when a conflicted
-        // transaction is re-executed, all subsequent transactions must undergo revalidation.
-        // However, if the re-executed transaction hasn't written to any new storage locations (as
-        // tracked by write_new_locations), subsequent transactions can skip this revalidation
-        // process. This optimization significantly decreases the total number of required
-        // validation tasks.
+        // If this incarnation expands its write set, already validated suffix transactions may
+        // have missed a new predecessor and validation must rewind to this transaction. Existing
+        // dependency/rewind coverage is sufficient when the write set does not expand.
         let mut write_new_locations = false;
         let conflict;
         let mut next = None;
         match result {
             Ok(result_and_state) => {
-                // only the miner involved in transaction should accumulate the rewards of finality
-                // txs return true if the tx doesn't visit the miner account
+                // Reads that must come from the committed state are accurate only when the
+                // committed prefix has reached this transaction.
                 let read_accurate_origin = executor.db_mut().read_accurate_origin();
 
                 let blocking_txs = executor.db_mut().take_estimate_txs();
@@ -529,31 +502,16 @@ where
                 if conflict {
                     if !read_accurate_origin {
                         self.metrics.record_coinbase_conflict();
-                        // Add all previous transactions as dependencies if miner doesn't accumulate
-                        // the rewards
+                        // A self-barrier keeps this transaction off workers until the committed
+                        // prefix reaches it.
                         self.tx_dependency.key_tx(txid, self.scheduler_ctx.commit_cursor());
                     } else {
                         self.metrics.record_estimate_conflict();
                         self.tx_dependency.add(txid, self.generate_dependent_tx(txid, &read_set));
                     }
                 } else {
-                    // Grevm employs an optimized thread scheduling strategy that differs
-                    // fundamentally from Block-STM's approach while intelligently preserving its
-                    // advantages. Unlike Block-STM where conflicted transactions persistently
-                    // occupy threads through busy-waiting retries, Grevm normally yields the thread
-                    // and re-schedules via DAG - except in critical path scenarios where it
-                    // demonstrates adaptive behavior. When detecting strictly linear dependencies
-                    // (where the next transaction immediately depends on the current one), Grevm
-                    // makes a crucial optimization: it maintains thread continuity by directly
-                    // executing the dependent transaction within the same thread rather than
-                    // yielding. This hybrid approach combines the general efficiency of DAG-based
-                    // scheduling for parallelizable workloads with Block-STM's optimal performance
-                    // for sequential dependency chains, effectively minimizing both thread
-                    // contention and scheduling overhead. The system automatically applies the most
-                    // appropriate execution strategy based on real-time dependency analysis,
-                    // ensuring neither purely optimistic (Block-STM) nor purely DAG-driven
-                    // approaches impose unnecessary performance penalties in their respective
-                    // worst-case scenarios.
+                    // Clearing reverse edges may hand the immediate successor directly to this
+                    // worker, avoiding a cursor round trip on a linear dependency chain.
                     next = self.tx_dependency.remove(txid, true);
                 }
                 *last_result = Some(TransactionResult {
@@ -641,8 +599,12 @@ where
             return None;
         }
 
+        // Capture the timestamp before scanning. A concurrent later rewind then has a newer lower
+        // bound and prevents this validation from reaching finality.
         let ts = self.scheduler_ctx.logical_timestamp();
-        // check the read version of read set
+        // Every read must still resolve to the same latest preceding incarnation, and that write
+        // must not be an estimate. A storage-origin read remains valid only when no preceding
+        // multi-version write exists.
         let mut conflict = false;
         let mut dependency: Option<TxId> = None;
         for (location, version) in result.read_set.iter() {
@@ -671,7 +633,7 @@ where
         }
         if conflict {
             self.metrics.record_version_conflict();
-            // mark write set as estimate
+            // Readers must not validate against writes produced by an invalid incarnation.
             self.mark_estimate(txid, &result.write_set);
         }
 
@@ -720,7 +682,8 @@ where
                 max_dep_id.is_none_or(|current| dep_id > current) &&
                 dep_id >= self.scheduler_ctx.finality_idx()
             {
-                // To prevent dependency explosion, keep only the highest preceding transaction.
+                // Keep only the latest predecessor as a scheduling hint. Read-set validation
+                // detects conflicts omitted from this edge set.
                 max_dep_id = Some(dep_id);
                 if dep_id == txid - 1 {
                     return max_dep_id;
@@ -732,14 +695,21 @@ where
 
     fn execution_task(&self, execute_id: TxId) -> Option<Task> {
         let mut tx = self.tx_states[execute_id].lock();
-        if matches!(tx.status, TransactionStatus::Initial | TransactionStatus::Conflict) {
-            tx.status = TransactionStatus::Executing;
-            tx.incarnation += 1;
-            Some(Task::Execution(TxVersion::new(execute_id, tx.incarnation)))
-        } else {
-            self.tx_dependency.remove(execute_id, false);
-            self.metrics.record_useless_dependency_update();
-            None
+        match tx.status {
+            TransactionStatus::Initial | TransactionStatus::Conflict => {
+                tx.status = TransactionStatus::Executing;
+                tx.incarnation += 1;
+                Some(Task::Execution(TxVersion::new(execute_id, tx.incarnation)))
+            }
+            // The owning worker has claimed this transaction but may not have entered
+            // `execute_task` yet. A duplicate cursor claim must not release its dependents early.
+            TransactionStatus::Executing => None,
+            _ => {
+                drop(tx);
+                self.tx_dependency.remove(execute_id, false);
+                self.metrics.record_useless_dependency_update();
+                None
+            }
         }
     }
 
@@ -753,6 +723,8 @@ where
                 self.scheduler_ctx.next_validation_idx(self.tx_dependency.index())
             {
                 let mut tx = self.tx_states[validation_idx].lock();
+                // Rewinds can make cursor claims duplicate or stale; state under this lock decides
+                // whether a validation task still exists.
                 match tx.status {
                     TransactionStatus::Executed | TransactionStatus::Unconfirmed => {
                         tx.status = TransactionStatus::Validating;
