@@ -429,8 +429,8 @@ where
         CancelOnPanic { scheduler: self }
     }
 
-    fn abort_on_thread_spawn_failure(&self, role: &'static str, error: &std::io::Error) {
-        tracing::warn!(role, %error, "failed to spawn GREVM scheduler thread; falling back to sequential execution");
+    fn abort_on_parallel_start_failure(&self, role: &'static str, error: &impl std::fmt::Display) {
+        tracing::warn!(role, %error, "failed to start GREVM scheduler role; aborting parallel execution");
         self.abort(AbortReason::FallbackSequential);
     }
 
@@ -472,7 +472,7 @@ where
                     }) {
                     Ok(thread) => thread,
                     Err(error) => {
-                        self.abort_on_thread_spawn_failure("finality", &error);
+                        self.abort_on_parallel_start_failure("finality", &error);
                         return CommitLoopResult {
                             committed: OrderedCommitOutput::default(),
                             error: None,
@@ -487,7 +487,7 @@ where
                     }) {
                     Ok(thread) => thread,
                     Err(error) => {
-                        self.abort_on_thread_spawn_failure("commit", &error);
+                        self.abort_on_parallel_start_failure("commit", &error);
                         if let Err(panic) = finality_thread.join() {
                             resume_unwind(panic);
                         }
@@ -497,34 +497,38 @@ where
                         }
                     }
                 };
-                let mut workers = Vec::with_capacity(concurrency_level);
-                for worker_id in 0..concurrency_level {
-                    match thread::Builder::new()
-                        .name(format!("grevm-worker-{worker_id}"))
-                        .spawn_scoped(scope, || {
-                            let _cancel = self.cancel_on_panic();
-                            let incarnation_db =
-                                IncarnationDb::new(&state_view, &self.mv_memory, &beneficiary);
-                            let mut cfg = self.cfg.clone();
-                            // Disable nonce checks during speculative execution. The commit thread
-                            // checks the nonce against committed state; a mismatch leaves the
-                            // transaction uncommitted and triggers sequential revalidation from
-                            // that transaction.
-                            cfg.disable_nonce_check = true;
-                            let mut executor = GrevmExecutor::new(
-                                incarnation_db,
-                                cfg,
-                                self.env.clone(),
-                                self.custom_precompiles.as_ref(),
-                                self.config.delegated_safety,
-                                self.reserve_planner.clone(),
-                            );
-                            self.run_worker(&mut executor, &beneficiary);
-                        }) {
-                        Ok(worker) => workers.push(worker),
-                        Err(error) => {
-                            self.abort_on_thread_spawn_failure("worker", &error);
-                            break
+                let mut workers = Vec::new();
+                if let Err(error) = workers.try_reserve_exact(concurrency_level) {
+                    self.abort_on_parallel_start_failure("worker handles", &error);
+                } else {
+                    for worker_id in 0..concurrency_level {
+                        match thread::Builder::new()
+                            .name(format!("grevm-worker-{worker_id}"))
+                            .spawn_scoped(scope, || {
+                                let _cancel = self.cancel_on_panic();
+                                let incarnation_db =
+                                    IncarnationDb::new(&state_view, &self.mv_memory, &beneficiary);
+                                let mut cfg = self.cfg.clone();
+                                // Disable nonce checks during speculative execution. The commit
+                                // thread checks the nonce against committed state; a mismatch
+                                // leaves the transaction uncommitted and triggers sequential
+                                // revalidation from that transaction.
+                                cfg.disable_nonce_check = true;
+                                let mut executor = GrevmExecutor::new(
+                                    incarnation_db,
+                                    cfg,
+                                    self.env.clone(),
+                                    self.custom_precompiles.as_ref(),
+                                    self.config.delegated_safety,
+                                    self.reserve_planner.clone(),
+                                );
+                                self.run_worker(&mut executor, &beneficiary);
+                            }) {
+                            Ok(worker) => workers.push(worker),
+                            Err(error) => {
+                                self.abort_on_parallel_start_failure("worker", &error);
+                                break
+                            }
                         }
                     }
                 }
