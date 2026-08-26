@@ -53,7 +53,8 @@ where
     /// # Errors
     ///
     /// Returns an error if this scheduler has already started, or if replay encounters a database
-    /// or fatal EVM error. Invalid transactions are recorded as skipped outcomes.
+    /// or fatal EVM error. Invalid transaction behavior follows
+    /// [`crate::GrevmConfig::invalid_transaction_policy`].
     pub fn fallback_sequential(&self) -> Result<(), GrevmError<DB::Error>> {
         self.run_once(|_| self.replay_uncommitted_suffix(CommittedPrefixEnd::ZERO))
     }
@@ -75,6 +76,9 @@ where
                     self.block_size,
                 )),
             });
+        }
+        if self.poll_cancellation() {
+            return Err(GrevmError::cancelled(start.min(self.block_size.saturating_sub(1))));
         }
         if start == self.block_size {
             return Ok(());
@@ -121,7 +125,13 @@ where
         };
         let SequentialReplayOutput { outcomes, error } = replay;
         self.results.lock().extend(outcomes);
-        error.map_or(Ok(()), Err)
+        if let Some(error) = error {
+            return Err(error)
+        }
+        if self.poll_cancellation() {
+            return Err(GrevmError::cancelled(self.block_size.saturating_sub(1)))
+        }
+        Ok(())
     }
 
     fn execute_sequential_suffix(

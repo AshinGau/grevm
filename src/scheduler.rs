@@ -264,9 +264,15 @@ where
         let dependency_distance = self.metrics.dependency_distance_histogram();
         while !self.should_abort() && finality_idx < self.block_size {
             let previous_finality_idx = finality_idx;
-            while let Some((mut tx_state, effective_lower_ts)) =
-                self.lock_finality_candidate(finality_idx, lower_ts)
-            {
+            loop {
+                if self.should_abort() {
+                    break
+                }
+                let Some((mut tx_state, effective_lower_ts)) =
+                    self.lock_finality_candidate(finality_idx, lower_ts)
+                else {
+                    break
+                };
                 lower_ts = effective_lower_ts;
                 let incarnation = tx_state.incarnation;
                 let dependency = tx_state.dependency;
@@ -350,7 +356,7 @@ where
         let mut commit_idx = 0;
         while !self.should_abort() && commit_idx < self.block_size {
             let previous_commit_idx = commit_idx;
-            while commit_idx < self.scheduler_ctx.finality_idx() {
+            while !self.should_abort() && commit_idx < self.scheduler_ctx.finality_idx() {
                 let Some(tx_result) = self.tx_results[commit_idx].lock().take() else {
                     self.abort(AbortReason::ParallelError {
                         txid: commit_idx,

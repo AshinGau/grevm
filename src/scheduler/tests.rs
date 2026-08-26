@@ -9,7 +9,7 @@ use revm_context::{
 };
 use revm_database::EmptyDB;
 use revm_primitives::{B256, Bytes, TxKind, U256, hardfork::SpecId};
-use revm_state::{AccountInfo, Bytecode};
+use revm_state::{Account, AccountInfo, Bytecode, EvmState};
 use std::{
     fmt::{Display, Formatter},
     sync::{
@@ -373,6 +373,10 @@ fn commit_abort_carries_error_without_using_tx_results() {
 }
 
 fn successful_speculative_result() -> SpeculativeResult {
+    successful_speculative_result_with_state(EvmState::default())
+}
+
+fn successful_speculative_result_with_state(state: EvmState) -> SpeculativeResult {
     SpeculativeResult::settled(ResultAndState {
         result: ExecutionResult::Success {
             reason: SuccessReason::Stop,
@@ -380,7 +384,7 @@ fn successful_speculative_result() -> SpeculativeResult {
             logs: Vec::new(),
             output: Output::Call(Bytes::new()),
         },
-        state: Default::default(),
+        state,
     })
 }
 
@@ -390,42 +394,35 @@ fn external_cancellation_retains_nonzero_committed_prefix() {
     let cancellation = cancelled.clone();
     let scheduler =
         empty_scheduler(2).with_cancellation(move || cancellation.load(Ordering::Acquire));
-    for tx_result in &scheduler.tx_results {
+    let mut changed_account = Account::from(AccountInfo::default());
+    changed_account.info.balance = U256::from(1);
+    changed_account.mark_touch();
+    let first_state: EvmState =
+        [(Address::with_last_byte(1), changed_account)].into_iter().collect();
+    for (index, tx_result) in scheduler.tx_results.iter().enumerate() {
         *tx_result.lock() = Some(TransactionResult {
             read_set: Default::default(),
             write_set: Default::default(),
-            execute_result: Ok(successful_speculative_result()),
+            execute_result: Ok(if index == 0 {
+                successful_speculative_result_with_state(first_state.clone())
+            } else {
+                successful_speculative_result()
+            }),
         });
     }
-    // Publish only the first result so commit must park with a non-zero prefix while the second
-    // result remains uncommitted.
-    scheduler.scheduler_ctx.publish_finality(1);
+    scheduler.scheduler_ctx.publish_finality(2);
 
-    let (observed_prefix, run) = std::thread::scope(|scope| {
-        let commit = scope.spawn(|| {
-            let mut state = scheduler.state.lock();
-            let (_, commit_state) = state.split_for_parallel();
-            let mut committer = OrderedCommitter::new(Address::ZERO, commit_state, false);
-            scheduler.run_commit_loop(&mut committer)
-        });
+    let run = {
+        let mut state = scheduler.state.lock();
+        let cancel_after_first_commit = cancelled.clone();
+        state.set_state_hook(Some(Box::new(move |_| {
+            cancel_after_first_commit.store(true, Ordering::Release);
+        })));
+        let (_, commit_state) = state.split_for_parallel();
+        let mut committer = OrderedCommitter::new(Address::ZERO, commit_state, false);
+        scheduler.run_commit_loop(&mut committer)
+    };
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let observed_prefix = loop {
-            if scheduler.scheduler_ctx.committed_idx() == 1 {
-                break true
-            }
-            if Instant::now() >= deadline {
-                break false
-            }
-            std::thread::yield_now();
-        };
-        // Always release the commit thread, including on timeout, so a failed assertion cannot
-        // strand this scoped thread in the test process.
-        cancelled.store(true, Ordering::Release);
-        scheduler.commit_wait.notify();
-        (observed_prefix, commit.join().expect("commit thread"))
-    });
-    assert!(observed_prefix, "the first transaction was not committed before cancellation");
     assert!(run.error.is_none());
     assert_eq!(run.committed.end(), CommittedPrefixEnd::for_test(1));
 
@@ -439,6 +436,16 @@ fn external_cancellation_retains_nonzero_committed_prefix() {
     let (outcomes, state) = scheduler.take_result_and_state();
     assert_eq!(outcomes.len(), 1);
     assert_eq!(state.bal_index().get(), 1);
+}
+
+#[test]
+fn cancellation_is_reported_for_an_empty_sequential_execution() {
+    let scheduler = empty_scheduler(0).with_cancellation(|| true);
+
+    let error = scheduler.fallback_sequential().expect_err("cancellation must be reported");
+    assert!(error.is_cancelled());
+    let (outcomes, _) = scheduler.take_result_and_state();
+    assert!(outcomes.is_empty());
 }
 
 #[test]
