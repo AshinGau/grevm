@@ -161,9 +161,24 @@ fn cancellation_is_distinguishable_in_parallel_and_sequential_modes() {
 }
 
 #[test]
+fn typed_cancellation_survives_an_earlier_fallback_abort_reason() {
+    let scheduler = empty_scheduler(1);
+    scheduler.abort(AbortReason::FallbackSequential);
+    let polls = AtomicUsize::new(0);
+
+    let result = scheduler.execute_with_typed_cancellation(|| {
+        // The preflight continues; sequential replay observes the interruption.
+        polls.fetch_add(1, Ordering::AcqRel) > 0
+    });
+
+    assert!(matches!(result, Err(control::SchedulerExecutionError::Interrupted)));
+    assert!(matches!(scheduler.abort_reason.get(), Some(AbortReason::FallbackSequential)));
+}
+
+#[test]
 fn installed_cancellation_uses_short_coordinator_polling() {
     let scheduler = empty_scheduler(0);
-    assert_eq!(scheduler.coordinator_wait_timeout(), STALL_TIMEOUT);
+    assert_eq!(scheduler.coordinator_wait_timeout(None), STALL_TIMEOUT);
 
     let cancelled = StdArc::new(AtomicBool::new(false));
     let callback_cancelled = cancelled.clone();
@@ -179,7 +194,7 @@ fn installed_cancellation_uses_short_coordinator_polling() {
         }
         is_cancelled
     });
-    assert_eq!(scheduler.coordinator_wait_timeout(), CANCELLATION_POLL_INTERVAL);
+    assert_eq!(scheduler.coordinator_wait_timeout(None), CANCELLATION_POLL_INTERVAL);
     assert!(CANCELLATION_POLL_INTERVAL < STALL_TIMEOUT);
 
     let canceller = std::thread::spawn(move || {
@@ -193,7 +208,7 @@ fn installed_cancellation_uses_short_coordinator_polling() {
     let (_, commit_state) = state.split_for_parallel();
     let mut committer = OrderedCommitter::new(Address::ZERO, commit_state, false);
     let started = Instant::now();
-    let run = scheduler.run_commit_loop(&mut committer);
+    let run = scheduler.run_commit_loop(&mut committer, None);
     let elapsed = started.elapsed();
     canceller.join().expect("canceller thread");
 
@@ -343,8 +358,9 @@ fn fatal_execution_abort_uses_recorded_txid_not_finality_idx() {
     });
     scheduler.abort(AbortReason::FatalEvmError(2));
 
-    let error =
-        scheduler.post_execute(CommittedPrefixEnd::ZERO).expect_err("fatal abort must be returned");
+    let error = scheduler
+        .post_execute(CommittedPrefixEnd::ZERO, None)
+        .expect_err("fatal abort must be returned");
     assert_eq!(scheduler.scheduler_ctx.finality_idx(), 0);
     assert_eq!(error.txid, 2);
     assert!(matches!(
@@ -362,7 +378,7 @@ fn commit_abort_carries_error_without_using_tx_results() {
     }));
 
     let error = scheduler
-        .post_execute(CommittedPrefixEnd::ZERO)
+        .post_execute(CommittedPrefixEnd::ZERO, None)
         .expect_err("commit abort must be returned");
     assert_eq!(error.txid, 1);
     assert!(matches!(
@@ -420,7 +436,7 @@ fn external_cancellation_retains_nonzero_committed_prefix() {
         })));
         let (_, commit_state) = state.split_for_parallel();
         let mut committer = OrderedCommitter::new(Address::ZERO, commit_state, false);
-        scheduler.run_commit_loop(&mut committer)
+        scheduler.run_commit_loop(&mut committer, None)
     };
 
     assert!(run.error.is_none());
@@ -429,7 +445,7 @@ fn external_cancellation_retains_nonzero_committed_prefix() {
     let committed = scheduler
         .install_commit_loop_result(run)
         .expect("cancellation must preserve the installed prefix");
-    let error = scheduler.post_execute(committed).expect_err("cancellation must be reported");
+    let error = scheduler.post_execute(committed, None).expect_err("cancellation must be reported");
     assert!(error.is_cancelled());
 
     assert!(scheduler.tx_results[1].lock().is_some());
@@ -471,7 +487,7 @@ fn ordered_commit_database_error_aborts_and_returns_exact_error() {
     let (_, commit_state) = state.split_for_parallel();
     let mut committer = OrderedCommitter::new(beneficiary, commit_state, false);
 
-    let run = scheduler.run_commit_loop(&mut committer);
+    let run = scheduler.run_commit_loop(&mut committer, None);
     let error = run.error.expect("commit must return DB error");
 
     assert_eq!(error.txid, 0);
@@ -513,7 +529,7 @@ fn ordered_commit_error_retains_the_successful_prefix() {
     let mut state = scheduler.state.lock();
     let (_, commit_state) = state.split_for_parallel();
     let mut committer = OrderedCommitter::new(beneficiary, commit_state, false);
-    let run = scheduler.run_commit_loop(&mut committer);
+    let run = scheduler.run_commit_loop(&mut committer, None);
 
     assert_eq!(run.committed.end(), CommittedPrefixEnd::for_test(1));
     assert_eq!(scheduler.scheduler_ctx.committed_idx(), 1);
@@ -608,7 +624,7 @@ fn parallel_error_replays_suffix_from_committed_prefix() {
         .abort(AbortReason::ParallelError { txid: 0, message: "test parallel invariant failure" });
 
     scheduler
-        .post_execute(CommittedPrefixEnd::for_test(1))
+        .post_execute(CommittedPrefixEnd::for_test(1), None)
         .expect("sequential suffix replay must succeed");
     let results = scheduler.results.lock();
     assert_eq!(results.len(), 2);

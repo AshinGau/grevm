@@ -4,7 +4,9 @@
 //! prefix; successful and invalid transactions extend it, while a fatal error preserves the
 //! completed portion for the caller.
 
-use super::{Scheduler, executor::build_evm, ordered_commit::CommittedPrefixEnd};
+use super::{
+    CancellationCheck, Scheduler, executor::build_evm, ordered_commit::CommittedPrefixEnd,
+};
 use crate::{
     GrevmError, InvalidTransaction, InvalidTransactionPolicy, TxExecutionOutcome, TxId,
     beneficiary::BeneficiaryMode,
@@ -37,6 +39,7 @@ where
         committed: CommittedPrefixEnd,
         txid: TxId,
         message: &str,
+        cancellation: CancellationCheck<'_>,
     ) -> Result<(), GrevmError<DB::Error>> {
         tracing::error!(
             target: "grevm::scheduler",
@@ -45,7 +48,7 @@ where
             reason = message,
             "parallel execution invariant failed; falling back to sequential execution",
         );
-        self.replay_uncommitted_suffix(committed)
+        self.replay_uncommitted_suffix(committed, cancellation)
     }
 
     /// Execute the uncommitted block suffix sequentially.
@@ -56,12 +59,13 @@ where
     /// or fatal EVM error. Invalid transaction behavior follows
     /// [`crate::GrevmConfig::invalid_transaction_policy`].
     pub fn fallback_sequential(&self) -> Result<(), GrevmError<DB::Error>> {
-        self.run_once(|_| self.replay_uncommitted_suffix(CommittedPrefixEnd::ZERO))
+        self.run_once(|_| self.replay_uncommitted_suffix(CommittedPrefixEnd::ZERO, None))
     }
 
     pub(super) fn replay_uncommitted_suffix(
         &self,
         committed: CommittedPrefixEnd,
+        cancellation: CancellationCheck<'_>,
     ) -> Result<(), GrevmError<DB::Error>> {
         let start = committed.index();
         let result_count = self.results.lock().len();
@@ -77,7 +81,7 @@ where
                 )),
             });
         }
-        if self.poll_cancellation() {
+        if self.poll_cancellation(cancellation) {
             return Err(GrevmError::cancelled(start.min(self.block_size.saturating_sub(1))));
         }
         if start == self.block_size {
@@ -95,7 +99,7 @@ where
             );
             // The planner describes the full block, so replay retains global TxIds rather than
             // rebasing future-cost lookups at `start`.
-            self.execute_sequential_suffix(start, |txid, tx| {
+            self.execute_sequential_suffix(start, cancellation, |txid, tx| {
                 let output = reject_nonce_overflow(evm.db_mut(), self.cfg.disable_nonce_check, tx)
                     .and_then(|()| {
                         evm.ctx.set_tx(tx.clone());
@@ -128,7 +132,7 @@ where
         if let Some(error) = error {
             return Err(error)
         }
-        if self.poll_cancellation() {
+        if self.poll_cancellation(cancellation) {
             return Err(GrevmError::cancelled(self.block_size.saturating_sub(1)))
         }
         Ok(())
@@ -137,13 +141,14 @@ where
     fn execute_sequential_suffix(
         &self,
         start: TxId,
+        cancellation: CancellationCheck<'_>,
         mut transact: impl FnMut(TxId, &TxEnv) -> Result<ExecutionResult, EVMError<DB::Error>>,
     ) -> SequentialReplayOutput<DB::Error> {
         let mut outcomes = Vec::with_capacity(self.block_size - start);
         for txid in start..self.block_size {
             // Internal abort reasons are what route execution into this recovery loop. Only an
             // external cancellation should interrupt suffix replay.
-            if self.poll_cancellation() {
+            if self.poll_cancellation(cancellation) {
                 return SequentialReplayOutput {
                     outcomes,
                     error: Some(GrevmError::cancelled(txid)),
@@ -262,7 +267,7 @@ mod tests {
     #[test]
     fn sequential_fatal_error_preserves_the_completed_prefix() {
         let scheduler = scheduler(3);
-        let replay = scheduler.execute_sequential_suffix(0, |txid, _| {
+        let replay = scheduler.execute_sequential_suffix(0, None, |txid, _| {
             if txid == 1 { Err(EVMError::Custom("fatal".to_owned())) } else { Ok(success()) }
         });
 
@@ -275,7 +280,7 @@ mod tests {
     #[test]
     fn skipped_transaction_still_advances_the_replay_prefix() {
         let scheduler = scheduler(2);
-        let replay = scheduler.execute_sequential_suffix(0, |txid, _| {
+        let replay = scheduler.execute_sequential_suffix(0, None, |txid, _| {
             if txid == 0 {
                 Err(EVMError::Transaction(InvalidTransaction::NonceTooLow { tx: 0, state: 1 }))
             } else {

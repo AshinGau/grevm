@@ -9,7 +9,8 @@
 //!
 //! By default, Grevm creates one speculative worker per logical CPU reported by
 //! [`std::thread::available_parallelism`] (falling back to eight if it is unavailable).
-//! Integrations can override the worker count through [`GrevmConfig::concurrency_level`].
+//! Integrations can override the worker count through [`SchedulerTuning::concurrency_level`] and
+//! combine that tuning with a named [`ExecutionProfile`] when constructing [`GrevmConfig`].
 //!
 //! ## Error Handling
 //!
@@ -19,6 +20,7 @@
 mod account;
 mod beneficiary;
 mod bundle;
+mod concurrent_db;
 mod config;
 mod delegated_safety;
 mod incarnation_db;
@@ -37,7 +39,8 @@ pub(crate) use model::{
 };
 
 pub use bundle::{ParallelBundleState, ParallelTakeBundle};
-pub use config::{GrevmConfig, InvalidTransactionPolicy};
+pub use concurrent_db::{ConcurrentDatabase, DatabaseFactory, ReadCache};
+pub use config::{ExecutionProfile, GrevmConfig, InvalidTransactionPolicy, SchedulerTuning};
 pub use delegated_safety::DelegatedSafetyConfig;
 pub use outcome::{GrevmError, TxExecutionOutcome};
 pub use parallel_state::{ParallelCacheState, ParallelState};
@@ -46,4 +49,7 @@ pub use precompile::{
     ParallelPrecompileResult, ParallelPrecompileState,
 };
 pub use revm_context::result::InvalidTransaction;
-pub use scheduler::Scheduler;
+pub use scheduler::{
+    Scheduler,
+    session::{BatchExecutionResult, ExecutionSession},
+};
