@@ -3,8 +3,8 @@
 //! End-to-end tests for grevm's opt-in EIP-7702 delegated-account safety policy.
 
 use grevm::{
-    DelegatedSafetyConfig, DynParallelPrecompile, GrevmConfig, InvalidTransaction, ParallelState,
-    ParallelTakeBundle, Scheduler, TxExecutionOutcome,
+    DelegatedSafetyConfig, DynParallelPrecompile, GrevmConfig, InvalidTransaction,
+    InvalidTransactionPolicy, ParallelState, ParallelTakeBundle, Scheduler, TxExecutionOutcome,
     test_utils::{
         TRANSFER_GAS_LIMIT,
         common::{account, execute, storage::InMemoryDB},
@@ -264,6 +264,26 @@ fn execute_block_with_precompiles(
     concurrency_level: usize,
     custom_precompiles: Option<Arc<Vec<(Address, DynParallelPrecompile)>>>,
 ) -> (Vec<TxExecutionOutcome>, revm_database::BundleState) {
+    execute_block_with_precompiles_and_spec(
+        db,
+        txs,
+        safety,
+        force_sequential,
+        concurrency_level,
+        custom_precompiles,
+        SpecId::PRAGUE,
+    )
+}
+
+fn execute_block_with_precompiles_and_spec(
+    db: InMemoryDB,
+    txs: Vec<TxEnv>,
+    safety: DelegatedSafetyConfig,
+    force_sequential: bool,
+    concurrency_level: usize,
+    custom_precompiles: Option<Arc<Vec<(Address, DynParallelPrecompile)>>>,
+    spec: SpecId,
+) -> (Vec<TxExecutionOutcome>, revm_database::BundleState) {
     let txs = Arc::new(txs);
     let block = BlockEnv { beneficiary: account::MINER_ADDRESS, ..Default::default() };
     let state = ParallelState::new(Arc::new(db), true, true);
@@ -271,10 +291,11 @@ fn execute_block_with_precompiles(
         concurrency_level,
         force_sequential,
         min_parallel_txs: 0,
+        invalid_transaction_policy: InvalidTransactionPolicy::IncludeNoop,
         delegated_safety: safety,
     };
     let scheduler = Scheduler::new_with_runtime_config(
-        CfgEnv::new_with_spec(SpecId::PRAGUE),
+        CfgEnv::new_with_spec(spec),
         block,
         txs,
         state,
@@ -285,6 +306,51 @@ fn execute_block_with_precompiles(
     let (outcomes, mut state) = scheduler.take_result_and_state();
     let bundle = state.parallel_take_bundle(BundleRetention::Reverts);
     (outcomes, bundle)
+}
+
+#[test]
+fn amsterdam_runtime_oog_without_reserve_checkpoint_matches_sequential() {
+    let sender = account::mock_eoa_address(0);
+    let recipient = Address::with_last_byte(0xF1);
+    let db =
+        InMemoryDB::new(account::mock_block_accounts(1), Default::default(), Default::default());
+    // Intrinsic gas consumes the regular budget. EIP-2780 then cannot charge the state-dependent
+    // new-recipient cost, so post-execution runs without ever opening the reserve checkpoint.
+    let tx = TxEnv {
+        caller: sender,
+        kind: TxKind::Call(recipient),
+        gas_limit: TRANSFER_GAS_LIMIT,
+        gas_price: 0,
+        nonce: 1,
+        value: U256::from(1),
+        ..Default::default()
+    };
+
+    let parallel = execute_block_with_precompiles_and_spec(
+        db.clone(),
+        vec![tx.clone()],
+        DelegatedSafetyConfig::enabled(),
+        false,
+        2,
+        None,
+        SpecId::AMSTERDAM,
+    );
+    let sequential = execute_block_with_precompiles_and_spec(
+        db,
+        vec![tx],
+        DelegatedSafetyConfig::enabled(),
+        true,
+        1,
+        None,
+        SpecId::AMSTERDAM,
+    );
+
+    assert_eq!(parallel.0, sequential.0);
+    execute::compare_bundle_state(&parallel.1, &sequential.1);
+    assert!(matches!(
+        parallel.0.as_slice(),
+        [TxExecutionOutcome::Executed(ExecutionResult::Halt { .. })]
+    ));
 }
 
 fn execute_safety(

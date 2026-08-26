@@ -2,8 +2,8 @@ use alloy_evm::{EthEvm, Evm, precompiles::PrecompilesMap};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 
 use crate::{
-    DelegatedSafetyConfig, GrevmConfig, ParallelState, ParallelTakeBundle, Scheduler,
-    TxExecutionOutcome,
+    DelegatedSafetyConfig, GrevmConfig, InvalidTransactionPolicy, ParallelState,
+    ParallelTakeBundle, Scheduler, TxExecutionOutcome,
 };
 use revm::{
     Context, DatabaseCommit, DatabaseRef, MainBuilder, MainContext, handler::EthPrecompiles,
@@ -64,7 +64,9 @@ fn assert_expected_metrics(
 /// stay disabled even if their defaults change later. Other scheduler settings still come from
 /// the environment for compatibility with the existing test and benchmark controls.
 pub fn revm_compatibility_config() -> GrevmConfig {
-    GrevmConfig::from_env().with_delegated_safety(DelegatedSafetyConfig::disabled())
+    GrevmConfig::from_env()
+        .with_delegated_safety(DelegatedSafetyConfig::disabled())
+        .with_invalid_transaction_policy(InvalidTransactionPolicy::IncludeNoop)
 }
 
 pub fn compare_bundle_state(left: &BundleState, right: &BundleState) {

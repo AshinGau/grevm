@@ -1,15 +1,19 @@
 use core::hash::{BuildHasherDefault, Hasher};
 use dashmap::{DashMap, Entry, mapref::one::RefMut};
 use metrics::histogram;
-use revm::{Database, DatabaseCommit, DatabaseRef};
+use revm::{Database, DatabaseCommit, DatabaseRef, OnStateHook, database_interface::bal::BalState};
 use revm_database::{
-    AccountStatus, BundleState, CacheState, PlainAccount, StorageWithOriginalValues,
-    TransitionAccount, TransitionState,
+    AccountStatus, BundleState, CacheState, DatabaseCommitExt, PlainAccount, TransitionAccount,
+    TransitionState,
     states::{CacheAccount, bundle_state::BundleRetention, plain_account::PlainStorage},
 };
 use revm_primitives::{Address, B256, U256};
-use revm_state::{Account, AccountInfo, Bytecode, EvmState};
+use revm_state::{
+    Account, AccountInfo, Bytecode, EvmState, EvmStorage,
+    bal::{BlockAccessIndex, alloy::AlloyBal},
+};
 use std::{
+    borrow::Cow,
     fmt::Formatter,
     time::{Duration, Instant},
     vec::Vec,
@@ -19,6 +23,8 @@ use std::{
 fn duration_micros(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000_000.0
 }
+
+type RevmTransition<'a> = TransitionAccount<Option<Cow<'a, EvmStorage>>>;
 
 #[derive(Clone, Debug, Default)]
 pub struct CacheAccountInfo {
@@ -31,62 +37,10 @@ impl CacheAccountInfo {
         Self { account, status }
     }
 
-    /// Increment balance by `balance` amount. Assume that balance will not
-    /// overflow or be zero.
-    ///
-    /// Note: only if balance is zero we would return None as no transition would be made.
-    pub fn increment_balance(&mut self, balance: u128) -> Option<TransitionAccount> {
-        if balance == 0 {
-            return None;
-        }
-        let (_, transition) = self.account_info_change(|info| {
-            info.balance = info.balance.saturating_add(U256::from(balance));
-        });
-        Some(transition)
-    }
-
-    /// Drain balance from account and return drained amount and transition.
-    ///
-    /// Used for DAO hardfork transition.
-    pub fn drain_balance(&mut self) -> (u128, TransitionAccount) {
-        self.account_info_change(|info| {
-            let output = info.balance;
-            info.balance = U256::ZERO;
-            output.try_into().unwrap()
-        })
-    }
-
-    fn account_info_change<T, F: FnOnce(&mut AccountInfo) -> T>(
-        &mut self,
-        change: F,
-    ) -> (T, TransitionAccount) {
-        let previous_status = self.status;
-        let previous_info = self.account.clone();
-        let mut info = self.account.take().unwrap_or_default();
-        let output = change(&mut info);
-        self.account = Some(info);
-
-        let had_no_nonce_and_code =
-            previous_info.as_ref().map(AccountInfo::has_no_code_and_nonce).unwrap_or_default();
-        self.status = self.status.on_changed(had_no_nonce_and_code);
-
-        (
-            output,
-            TransitionAccount {
-                info: self.account.clone(),
-                status: self.status,
-                previous_info,
-                previous_status,
-                storage: Default::default(),
-                storage_was_destroyed: false,
-            },
-        )
-    }
-
     /// Consume self and make account as destroyed.
     ///
     /// Set account as None and set status to Destroyer or DestroyedAgain.
-    pub fn selfdestruct(&mut self) -> Option<TransitionAccount> {
+    pub fn selfdestruct<'a>(&mut self) -> Option<RevmTransition<'a>> {
         // account should be None after selfdestruct so we can take it.
         let previous_info = self.account.take();
         let previous_status = self.status;
@@ -101,22 +55,25 @@ impl CacheAccountInfo {
                 status: self.status,
                 previous_info,
                 previous_status,
-                storage: Default::default(),
+                storage: None,
                 storage_was_destroyed: true,
             })
         }
     }
 
     /// Newly created account.
-    pub fn newly_created(
+    pub fn newly_created<'a>(
         &mut self,
-        new_info: AccountInfo,
-        new_storage: StorageWithOriginalValues,
-    ) -> (TransitionAccount, PlainStorage) {
+        account: Cow<'a, Account>,
+    ) -> (RevmTransition<'a>, PlainStorage) {
         let previous_info = self.account.take();
         let previous_status = self.status;
-
-        let new_bundle_storage = new_storage.iter().map(|(k, s)| (*k, s.present_value)).collect();
+        let new_bundle_storage =
+            account.storage.iter().map(|(key, slot)| (*key, slot.present_value)).collect();
+        let (new_info, new_storage) = match account {
+            Cow::Borrowed(account) => (account.info.clone(), Some(Cow::Borrowed(&account.storage))),
+            Cow::Owned(account) => (account.info, Some(Cow::Owned(account.storage))),
+        };
 
         self.status = self.status.on_created();
         let transition_account = TransitionAccount {
@@ -134,7 +91,7 @@ impl CacheAccountInfo {
     /// Touch empty account, related to EIP-161 state clear.
     ///
     /// This account returns the Transition that is used to create the BundleState.
-    pub fn touch_empty_eip161(&mut self) -> Option<TransitionAccount> {
+    pub fn touch_empty_eip161<'a>(&mut self) -> Option<RevmTransition<'a>> {
         // Set account to None.
         let previous_info = self.account.take();
         let previous_status = self.status;
@@ -155,25 +112,26 @@ impl CacheAccountInfo {
                 status: self.status,
                 previous_info,
                 previous_status,
-                storage: Default::default(),
+                storage: None,
                 storage_was_destroyed: true,
             })
         }
     }
 
-    pub fn change(
-        &mut self,
-        new: AccountInfo,
-        storage: StorageWithOriginalValues,
-    ) -> (TransitionAccount, PlainStorage) {
+    pub fn change<'a>(&mut self, account: Cow<'a, Account>) -> (RevmTransition<'a>, PlainStorage) {
         let previous_info = self.account.take();
         let previous_status = self.status;
-        let new_bundle_storage = storage.iter().map(|(k, s)| (*k, s.present_value)).collect();
+        let new_bundle_storage =
+            account.storage.iter().map(|(key, slot)| (*key, slot.present_value)).collect();
+        let (new_info, storage) = match account {
+            Cow::Borrowed(account) => (account.info.clone(), Some(Cow::Borrowed(&account.storage))),
+            Cow::Owned(account) => (account.info, Some(Cow::Owned(account.storage))),
+        };
 
         let had_no_nonce_and_code =
             previous_info.as_ref().map(AccountInfo::has_no_code_and_nonce).unwrap_or_default();
         self.status = self.status.on_changed(had_no_nonce_and_code);
-        self.account = Some(new);
+        self.account = Some(new_info);
 
         (
             TransitionAccount {
@@ -271,50 +229,77 @@ impl ParallelCacheState {
         self.insert_account(address, info);
     }
 
-    /// Apply output of revm execution and create account transitions that are used to build
-    /// BundleState.
-    pub fn apply_evm_state(&mut self, evm_state: EvmState) -> Vec<(Address, TransitionAccount)> {
-        self.apply_evm_state_inner(evm_state)
-    }
-
-    fn apply_evm_state_inner(&self, evm_state: EvmState) -> Vec<(Address, TransitionAccount)> {
+    fn apply_evm_state_inner(
+        &self,
+        evm_state: EvmState,
+    ) -> Vec<(Address, RevmTransition<'static>)> {
         let mut transitions = Vec::with_capacity(evm_state.len());
         for (address, account) in evm_state {
-            if let Some(transition) = self.apply_account_state(address, account) {
+            if let Some(transition) = self.apply_account_state(address, Cow::Owned(account)) {
                 transitions.push((address, transition));
             }
         }
         transitions
     }
 
-    fn get_account_mut(&'_ self, address: Address) -> RefMut<'_, Address, CacheAccountInfo> {
-        self.accounts.get_mut(&address).expect("All accounts should be present inside cache")
+    fn apply_evm_state_ref<'a>(
+        &self,
+        evm_state: &'a EvmState,
+    ) -> Vec<(Address, RevmTransition<'a>)> {
+        let mut transitions = Vec::with_capacity(evm_state.len());
+        for (address, account) in evm_state {
+            if let Some(transition) = self.apply_account_state(*address, Cow::Borrowed(account)) {
+                transitions.push((*address, transition));
+            }
+        }
+        transitions
+    }
+
+    fn get_or_insert_account_mut(
+        &'_ self,
+        address: Address,
+        account: &Account,
+    ) -> RefMut<'_, Address, CacheAccountInfo> {
+        match self.accounts.entry(address) {
+            Entry::Occupied(entry) => entry.into_ref(),
+            Entry::Vacant(entry) => {
+                // A canonical commit can originate from an EVM backed by a different database.
+                // Preserve its original account metadata just as revm's CacheState does.
+                let cache_account = if account.is_loaded_as_not_existing() {
+                    CacheAccountInfo::new(None, AccountStatus::LoadedNotExisting)
+                } else {
+                    let original = account.original_info();
+                    if original.is_empty() {
+                        CacheAccountInfo::new(
+                            Some(AccountInfo::default()),
+                            AccountStatus::LoadedEmptyEIP161,
+                        )
+                    } else {
+                        CacheAccountInfo::new(Some(original), AccountStatus::Loaded)
+                    }
+                };
+                entry.insert(cache_account)
+            }
+        }
     }
 
     /// Apply updated account state to the cached account.
     /// Returns account transition if applicable.
-    fn apply_account_state(&self, address: Address, account: Account) -> Option<TransitionAccount> {
-        // not touched account are never changed.
+    fn apply_account_state<'a>(
+        &self,
+        address: Address,
+        account: Cow<'a, Account>,
+    ) -> Option<RevmTransition<'a>> {
         if !account.is_touched() {
             return None;
         }
-        let is_created = account.is_created();
-        let is_empty = account.is_empty();
-        let is_destructed = account.is_selfdestructed();
-        // transform evm storage to storage with previous value.
-        let changed_storage = account
-            .storage
-            .into_iter()
-            .filter(|(_, slot)| slot.is_changed())
-            .map(|(key, slot)| (key, slot.into()))
-            .collect();
-
+        let mut cached_account = self.get_or_insert_account_mut(address, &account);
         let (transition, changed_slots) = {
             // If it is marked as selfdestructed inside revm
             // we need to changed state to destroyed.
-            if is_destructed {
+            if account.is_selfdestructed() {
                 self.storage.remove(&address);
-                return self.get_account_mut(address).selfdestruct();
+                return cached_account.selfdestruct();
             }
 
             // Note: it can happen that created contract get selfdestructed in same block
@@ -325,12 +310,12 @@ impl ParallelCacheState {
             // Note: It is possibility to create KECCAK_EMPTY contract with some storage
             // by just setting storage inside CRATE constructor. Overlap of those contracts
             // is not possible because CREATE2 is introduced later.
-            if is_created {
-                let info = account.info;
+            if account.is_created() {
+                let code_hash = account.info.code_hash;
+                let code = account.info.code.clone().expect("created account must contain code");
                 self.storage.remove(&address);
-                let (transition, changed_slots) =
-                    self.get_account_mut(address).newly_created(info.clone(), changed_storage);
-                self.contracts.entry(info.code_hash).or_insert_with(|| info.code.clone().unwrap());
+                let (transition, changed_slots) = cached_account.newly_created(account);
+                self.contracts.entry(code_hash).or_insert(code);
                 (Some(transition), Some(changed_slots))
             }
             // Account is touched, but not selfdestructed or newly created.
@@ -340,16 +325,15 @@ impl ParallelCacheState {
             // `finalize()`: newly materialized empty accounts are marked as created, while
             // pre-existing empty accounts are unmarked as touched. Therefore, an account that
             // reaches the commit layer as touched, empty, and not created must be cleared.
-            else if is_empty {
+            else if account.is_empty() {
                 self.storage.remove(&address);
-                drop(changed_storage);
-                (self.get_account_mut(address).touch_empty_eip161(), None)
+                (cached_account.touch_empty_eip161(), None)
             } else {
-                let (transition, changed_slots) =
-                    self.get_account_mut(address).change(account.info, changed_storage);
+                let (transition, changed_slots) = cached_account.change(account);
                 (Some(transition), Some(changed_slots))
             }
         };
+        drop(cached_account);
         if let Some(changed_slots) = changed_slots &&
             !changed_slots.is_empty()
         {
@@ -438,6 +422,14 @@ pub struct ParallelState<DB> {
     /// This map can be used to give different values for block hashes if in case
     /// The fork block is different or some blocks are not saved inside database.
     pub block_hashes: DashMap<u64, B256, BuildIdentityHasher>,
+    /// EIP-7928 builder state. Only canonical commits mutate the BAL builder.
+    ///
+    /// Input-BAL reads require a transaction-indexed worker view and are intentionally outside
+    /// this state type.
+    bal_state: BalState,
+
+    /// Hook invoked for canonical state commits.
+    state_hook: Option<Box<dyn OnStateHook>>,
 
     update_db_metrics: bool,
     db_latency: metrics::Histogram,
@@ -505,23 +497,6 @@ impl<'a, DB: DatabaseRef> ParallelStateView<'a, DB> {
             Entry::Vacant(entry) => Ok(entry.insert(account)),
             Entry::Occupied(entry) => Ok(entry.into_ref()),
         }
-    }
-
-    fn increment_balance_transitions(
-        self,
-        balances: impl IntoIterator<Item = (Address, u128)>,
-    ) -> Result<Vec<(Address, TransitionAccount)>, DB::Error> {
-        let mut transitions = Vec::new();
-        for (address, balance) in balances {
-            if balance == 0 {
-                continue;
-            }
-            let mut account = self.load_mut_cache_account(address)?;
-            let transition =
-                account.increment_balance(balance).expect("balance was checked as non-zero");
-            transitions.push((address, transition));
-        }
-        Ok(transitions)
     }
 
     fn db_basic(self, address: Address) -> Result<Option<AccountInfo>, DB::Error> {
@@ -625,6 +600,14 @@ impl<DB: DatabaseRef> DatabaseRef for ParallelStateView<'_, DB> {
 pub(crate) struct ParallelStateCommit<'a, DB> {
     shared: ParallelStateView<'a, DB>,
     transition_state: &'a mut Option<TransitionState>,
+    bal_state: &'a mut BalState,
+    state_hook: &'a mut Option<Box<dyn OnStateHook>>,
+}
+
+impl<DB> ParallelStateCommit<'_, DB> {
+    pub(crate) fn bump_bal_index(&mut self) {
+        self.bal_state.bump_bal_index();
+    }
 }
 
 impl<DB: DatabaseRef> DatabaseRef for ParallelStateCommit<'_, DB> {
@@ -648,9 +631,34 @@ impl<DB: DatabaseRef> DatabaseRef for ParallelStateCommit<'_, DB> {
 }
 
 impl<DB: DatabaseRef> DatabaseCommit for ParallelStateCommit<'_, DB> {
-    fn commit(&mut self, evm_state: revm_primitives::AddressMap<Account>) {
-        let transitions = self.shared.cache.apply_evm_state_inner(evm_state);
-        if let Some(state) = self.transition_state.as_mut() {
+    fn commit(&mut self, evm_state: EvmState) {
+        commit_canonical_state(
+            self.shared.cache,
+            self.transition_state,
+            self.bal_state,
+            self.state_hook,
+            evm_state,
+        );
+    }
+}
+
+fn commit_canonical_state(
+    cache: &ParallelCacheState,
+    transition_state: &mut Option<TransitionState>,
+    bal_state: &mut BalState,
+    state_hook: &mut Option<Box<dyn OnStateHook>>,
+    evm_state: EvmState,
+) {
+    bal_state.commit(&evm_state);
+    if let Some(hook) = state_hook.as_mut() {
+        let transitions = cache.apply_evm_state_ref(&evm_state);
+        if let Some(state) = transition_state.as_mut() {
+            state.add_transitions(transitions);
+        }
+        hook.on_state(evm_state);
+    } else {
+        let transitions = cache.apply_evm_state_inner(evm_state);
+        if let Some(state) = transition_state.as_mut() {
             state.add_transitions(transitions);
         }
     }
@@ -678,6 +686,8 @@ impl<DB: DatabaseRef> ParallelState<DB> {
             transition_state: with_bundle_update.then(TransitionState::default),
             bundle_state: BundleState::default(),
             block_hashes: DashMap::default(),
+            bal_state: BalState::default(),
+            state_hook: None,
             update_db_metrics,
             db_latency: histogram!("grevm.db_latency_us"),
         }
@@ -704,6 +714,8 @@ impl<DB: DatabaseRef> ParallelState<DB> {
             transition_state,
             bundle_state: _,
             block_hashes,
+            bal_state,
+            state_hook,
             update_db_metrics,
             db_latency,
         } = self;
@@ -714,7 +726,43 @@ impl<DB: DatabaseRef> ParallelState<DB> {
             update_db_metrics: *update_db_metrics,
             db_latency,
         };
-        (shared, ParallelStateCommit { shared, transition_state })
+        (shared, ParallelStateCommit { shared, transition_state, bal_state, state_hook })
+    }
+
+    /// Enable EIP-7928 block access list construction.
+    pub fn with_bal_builder(mut self) -> Self {
+        self.bal_state = core::mem::take(&mut self.bal_state).with_bal_builder();
+        self
+    }
+
+    /// Enable EIP-7928 block access list construction when `enabled` is true.
+    pub fn with_bal_builder_if(self, enabled: bool) -> Self {
+        if enabled { self.with_bal_builder() } else { self }
+    }
+
+    /// Set the EIP-7928 index used by the next canonical commit.
+    pub const fn set_bal_index(&mut self, index: BlockAccessIndex) {
+        self.bal_state.bal_index = index;
+    }
+
+    /// Advance the EIP-7928 index used by the next canonical commit.
+    pub const fn bump_bal_index(&mut self) {
+        self.bal_state.bump_bal_index();
+    }
+
+    /// Return the EIP-7928 index used by the next canonical commit.
+    pub const fn bal_index(&self) -> BlockAccessIndex {
+        self.bal_state.bal_index()
+    }
+
+    /// Take the constructed EIP-7928 block access list.
+    pub fn take_built_alloy_bal(&mut self) -> Option<AlloyBal> {
+        self.bal_state.take_built_alloy_bal()
+    }
+
+    /// Install or clear the canonical state commit hook.
+    pub fn set_state_hook(&mut self, hook: Option<Box<dyn OnStateHook>>) {
+        self.state_hook = hook;
     }
 
     /// Returns the size hint for the inner bundle state.
@@ -735,9 +783,7 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         &mut self,
         balances: impl IntoIterator<Item = (Address, u128)>,
     ) -> Result<(), DB::Error> {
-        let transitions = self.shared_view().increment_balance_transitions(balances)?;
-        self.apply_transition(transitions);
-        Ok(())
+        DatabaseCommitExt::increment_balances(self, balances)
     }
 
     /// Drain balances from given account and return those values.
@@ -747,20 +793,7 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         &mut self,
         addresses: impl IntoIterator<Item = Address>,
     ) -> Result<Vec<u128>, DB::Error> {
-        // make transition and update cache state
-        let mut transitions = Vec::new();
-        let mut balances = Vec::new();
-        for address in addresses {
-            let mut original_account = self.load_mut_cache_account(address)?;
-            let (balance, transition) = original_account.drain_balance();
-            balances.push(balance);
-            transitions.push((address, transition))
-        }
-        // append transition
-        if let Some(s) = self.transition_state.as_mut() {
-            s.add_transitions(transitions)
-        }
-        Ok(balances)
+        DatabaseCommitExt::drain_balances(self, addresses)
     }
 
     /// Insert non-existent account
@@ -781,14 +814,6 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         storage: PlainStorage,
     ) {
         self.cache.insert_account_with_storage(address, info, storage)
-    }
-
-    /// Apply evm transitions to transition state.
-    pub fn apply_transition(&mut self, transitions: Vec<(Address, TransitionAccount)>) {
-        // add transition to transition state.
-        if let Some(s) = self.transition_state.as_mut() {
-            s.add_transitions(transitions)
-        }
     }
 
     /// Take all transitions and merge them inside bundle state.
@@ -881,16 +906,58 @@ impl<DB: DatabaseRef> DatabaseRef for ParallelState<DB> {
 }
 
 impl<DB: DatabaseRef> DatabaseCommit for ParallelState<DB> {
-    fn commit(&mut self, evm_state: revm_primitives::AddressMap<Account>) {
-        let transitions = self.cache.apply_evm_state(evm_state);
-        self.apply_transition(transitions);
+    fn commit(&mut self, evm_state: EvmState) {
+        commit_canonical_state(
+            &self.cache,
+            &mut self.transition_state,
+            &mut self.bal_state,
+            &mut self.state_hook,
+            evm_state,
+        );
+    }
+}
+
+impl<DB: DatabaseRef> alloy_evm::block::BalIndexedDatabase for ParallelState<DB> {
+    fn set_bal_index(&mut self, index: u64) {
+        ParallelState::set_bal_index(self, BlockAccessIndex::new(index));
+    }
+
+    fn bump_bal_index(&mut self) {
+        ParallelState::bump_bal_index(self);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use revm_database::{CacheDB, EmptyDB};
+    use revm_database::{CacheDB, EmptyDB, StateBuilder};
+    use revm_state::{EvmStorageSlot, TransactionId};
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    fn changed_account_state(
+        address: Address,
+        original_balance: u64,
+        present_balance: u64,
+        original_storage: u64,
+        present_storage: u64,
+    ) -> EvmState {
+        let mut account = Account::from(AccountInfo {
+            balance: U256::from(original_balance),
+            nonce: 1,
+            ..Default::default()
+        });
+        account.info.balance = U256::from(present_balance);
+        account.storage.insert(
+            U256::from(1),
+            EvmStorageSlot::new_changed(
+                U256::from(original_storage),
+                U256::from(present_storage),
+                TransactionId::new(1).unwrap(),
+            ),
+        );
+        account.mark_touch();
+        [(address, account)].into_iter().collect()
+    }
 
     #[test]
     fn duration_micros_preserves_sub_microsecond_precision() {
@@ -921,5 +988,80 @@ mod tests {
 
         assert_eq!(state.storage_ref(address, U256::ZERO).unwrap(), U256::ZERO);
         assert!(!state.cache.accounts.contains_key(&address));
+    }
+
+    #[test]
+    fn canonical_commits_match_revm_bal_and_reach_state_hook_once() {
+        let address = Address::with_last_byte(0x11);
+        let pre = changed_account_state(address, 10, 11, 1, 1);
+        let transaction = changed_account_state(address, 11, 14, 1, 2);
+        let post = changed_account_state(address, 14, 15, 2, 2);
+
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let hook_observed = observed.clone();
+        let mut parallel = ParallelState::new(EmptyDB::default(), true, false).with_bal_builder();
+        parallel.set_state_hook(Some(Box::new(move |state| {
+            hook_observed.lock().unwrap().push(state);
+        })));
+
+        let mut reference = StateBuilder::new()
+            .with_database(EmptyDB::default())
+            .with_bundle_update()
+            .with_bal_builder()
+            .build();
+
+        for (index, changes) in
+            [pre.clone(), transaction.clone(), post.clone()].into_iter().enumerate()
+        {
+            let index = BlockAccessIndex::new(index as u64);
+            parallel.set_bal_index(index);
+            reference.set_bal_index(index);
+            parallel.commit(changes.clone());
+            reference.commit(changes);
+        }
+
+        assert_eq!(parallel.take_built_alloy_bal(), reference.take_built_alloy_bal());
+        assert_eq!(observed.lock().unwrap().as_slice(), &[pre, transaction, post]);
+    }
+
+    #[test]
+    fn canonical_commit_accepts_state_from_an_uncached_evm() {
+        let address = Address::with_last_byte(0x22);
+        let changes = changed_account_state(address, 7, 9, 3, 4);
+        let mut state = ParallelState::new(EmptyDB::default(), true, false);
+
+        state.commit(changes);
+
+        let info = state.basic_ref(address).unwrap().expect("committed account");
+        assert_eq!(info.balance, U256::from(9));
+        assert_eq!(state.storage_ref(address, U256::from(1)).unwrap(), U256::from(4));
+    }
+
+    #[test]
+    fn balance_increments_use_the_canonical_bal_and_hook_commit_path() {
+        let address = Address::with_last_byte(0x33);
+        let info = AccountInfo { balance: U256::from(5), nonce: 1, ..Default::default() };
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let hook_observed = observed.clone();
+
+        let mut parallel = ParallelState::new(EmptyDB::default(), true, false).with_bal_builder();
+        parallel.insert_account(address, info.clone());
+        parallel.set_state_hook(Some(Box::new(move |state| {
+            hook_observed.lock().unwrap().push(state);
+        })));
+
+        let mut reference = StateBuilder::new()
+            .with_database(EmptyDB::default())
+            .with_bundle_update()
+            .with_bal_builder()
+            .build();
+        reference.insert_account(address, info);
+
+        parallel.increment_balances([(address, 8)]).unwrap();
+        reference.increment_balances([(address, 8)]).unwrap();
+
+        assert_eq!(parallel.take_built_alloy_bal(), reference.take_built_alloy_bal());
+        assert_eq!(observed.lock().unwrap().len(), 1);
+        assert_eq!(parallel.basic_ref(address).unwrap().unwrap().balance, U256::from(13));
     }
 }

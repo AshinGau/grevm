@@ -4,7 +4,7 @@
 
 ```toml
 [dependencies]
-grevm = { git = "https://github.com/Galxe/grevm.git", branch = "main" }
+grevm = { git = "https://github.com/AshinGau/grevm.git", rev = "<immutable-commit>" }
 ```
 
 ## Standalone usage
@@ -50,8 +50,8 @@ where
     let (results, mut state) = scheduler.take_result_and_state();
     let bundle = state.parallel_take_bundle(BundleRetention::Reverts);
 
-    // `results`: one outcome per transaction, in order. Transaction-validation errors are
-    // returned as `Skipped(InvalidTransaction)` and do not modify state or consume gas.
+    // The safe default rejects invalid fixed-block transactions. `Skipped` is only returned when
+    // the caller explicitly selects Omit or IncludeNoop policy.
     for outcome in &results {
         match outcome {
             TxExecutionOutcome::Executed(result) => {
@@ -118,6 +118,7 @@ impl<DB: DatabaseRef> ParallelTakeBundle for ParallelState<DB> {
 ```
 
 Public items re-exported from the crate root include `Scheduler`, `GrevmConfig`,
+`InvalidTransactionPolicy`,
 `DelegatedSafetyConfig`, `ParallelState`, `ParallelCacheState`, `TxExecutionOutcome`,
 `InvalidTransaction`, `GrevmError`, `ParallelPrecompile`, `DynParallelPrecompile`,
 `ParallelPrecompileInput`, `ParallelPrecompileState`, `ParallelPrecompileResult`, and

@@ -19,8 +19,9 @@ See [Use Grevm with reth](docs/use-with-reth.md) for the public API and integrat
    nonce checking is enabled, folds any deferred beneficiary reward into the EVM state, commits it
    once, records the outcome, and only then publishes the new committed-prefix boundary.
 5. A nonce mismatch or recoverable scheduler abort replays only the uncommitted suffix
-   sequentially. Invalid transactions become ordered `Skipped` outcomes; fatal errors retain the
-   successfully committed prefix.
+   sequentially. Invalid transaction handling is explicit: fixed blocks abort by default, payload
+   builders can omit candidates, and protocols that encode invalid no-ops can retain their block
+   positions. Fatal errors retain the successfully committed prefix.
 
 `GrevmConfig::concurrency_level` controls the number of speculative workers. The finality and
 ordered-commit loops are additional coordinator threads.

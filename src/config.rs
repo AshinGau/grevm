@@ -1,5 +1,26 @@
 use crate::DelegatedSafetyConfig;
 
+/// Policy for a transaction that is invalid against the ordered committed state.
+///
+/// EVM reverts and halts are valid executions and are unaffected by this policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InvalidTransactionPolicy {
+    /// Return the invalid transaction as an execution error.
+    ///
+    /// Use this for fixed blocks, where every transaction must be valid.
+    #[default]
+    Abort,
+    /// Omit the invalid candidate without advancing the EIP-7928 block index.
+    ///
+    /// Use this while building a block from a transaction pool.
+    Omit,
+    /// Keep the invalid transaction as a block-positioned no-op.
+    ///
+    /// This preserves Grevm's historical skip behavior for protocols that encode invalid
+    /// transactions as no-ops in the block.
+    IncludeNoop,
+}
+
 /// Runtime configuration for one grevm scheduler.
 ///
 /// Environment variables are read once when [`Self::from_env`] is called. Callers that need
@@ -13,6 +34,8 @@ pub struct GrevmConfig {
     pub force_sequential: bool,
     /// Blocks smaller than this threshold use the sequential path.
     pub min_parallel_txs: usize,
+    /// How invalid transactions affect execution and the EIP-7928 block index.
+    pub invalid_transaction_policy: InvalidTransactionPolicy,
     /// EIP-7702 delegated-account safety policy.
     pub delegated_safety: DelegatedSafetyConfig,
 }
@@ -25,6 +48,7 @@ impl GrevmConfig {
             concurrency_level: env_or("GREVM_CONCURRENT_LEVEL", defaults.concurrency_level),
             force_sequential: env_or("GREVM_FALLBACK_SEQUENTIAL", defaults.force_sequential),
             min_parallel_txs: env_or("GREVM_MIN_PARALLEL_TXS", defaults.min_parallel_txs),
+            invalid_transaction_policy: defaults.invalid_transaction_policy,
             delegated_safety: defaults.delegated_safety,
         }
     }
@@ -32,6 +56,15 @@ impl GrevmConfig {
     /// Overrides the delegated-account policy while preserving all execution settings.
     pub fn with_delegated_safety(mut self, delegated_safety: DelegatedSafetyConfig) -> Self {
         self.delegated_safety = delegated_safety;
+        self
+    }
+
+    /// Configure how invalid transactions affect execution and block indexing.
+    pub const fn with_invalid_transaction_policy(
+        mut self,
+        policy: InvalidTransactionPolicy,
+    ) -> Self {
+        self.invalid_transaction_policy = policy;
         self
     }
 }
@@ -42,6 +75,7 @@ impl Default for GrevmConfig {
             concurrency_level: std::thread::available_parallelism().map_or(8, |value| value.get()),
             force_sequential: false,
             min_parallel_txs: 64,
+            invalid_transaction_policy: InvalidTransactionPolicy::Abort,
             delegated_safety: DelegatedSafetyConfig::default(),
         }
     }
@@ -64,6 +98,7 @@ mod tests {
         assert!(config.concurrency_level > 0);
         assert_eq!(config.min_parallel_txs, 64);
         assert!(!config.force_sequential);
+        assert_eq!(config.invalid_transaction_policy, InvalidTransactionPolicy::Abort);
         assert!(!config.delegated_safety.forbid_delegated_create);
         assert!(!config.delegated_safety.reserve_delegated_balance);
     }
@@ -74,6 +109,7 @@ mod tests {
             concurrency_level: 3,
             force_sequential: true,
             min_parallel_txs: 7,
+            invalid_transaction_policy: InvalidTransactionPolicy::Abort,
             delegated_safety: DelegatedSafetyConfig::default(),
         }
         .with_delegated_safety(DelegatedSafetyConfig::enabled());
@@ -81,6 +117,7 @@ mod tests {
         assert_eq!(config.concurrency_level, 3);
         assert!(config.force_sequential);
         assert_eq!(config.min_parallel_txs, 7);
+        assert_eq!(config.invalid_transaction_policy, InvalidTransactionPolicy::Abort);
         assert!(config.delegated_safety.forbid_delegated_create);
         assert!(config.delegated_safety.reserve_delegated_balance);
     }

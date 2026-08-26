@@ -1,7 +1,8 @@
 #![allow(missing_docs)]
 
 use grevm::{
-    InvalidTransaction, ParallelState, Scheduler, TxExecutionOutcome,
+    GrevmConfig, InvalidTransaction, InvalidTransactionPolicy, ParallelState, Scheduler,
+    TxExecutionOutcome,
     test_utils::{
         TRANSFER_GAS_LIMIT,
         common::{account, execute, storage::InMemoryDB},
@@ -14,6 +15,10 @@ use std::sync::Arc;
 
 const GIGA_GAS: u64 = 1_000_000_000;
 const MIN_PARALLEL_BLOCK_SIZE: usize = 64;
+
+fn skip_invalid_config() -> GrevmConfig {
+    GrevmConfig::from_env().with_invalid_transaction_policy(InvalidTransactionPolicy::IncludeNoop)
+}
 
 fn execute_outcomes(txs: Vec<TxEnv>) -> Vec<TxExecutionOutcome> {
     let accounts = account::mock_block_accounts(MIN_PARALLEL_BLOCK_SIZE + 1);
@@ -134,12 +139,13 @@ fn intrinsic_gas_error_falls_back_and_continues_suffix() {
     txs.extend((1..MIN_PARALLEL_BLOCK_SIZE).map(independent_transfer));
 
     let state = ParallelState::new(db, true, false);
-    let scheduler = Scheduler::new(
+    let scheduler = Scheduler::new_with_runtime_config(
         CfgEnv::new_with_spec(SpecId::SHANGHAI),
         BlockEnv::default(),
         Arc::new(txs),
         state,
         None,
+        skip_invalid_config(),
     );
     scheduler.parallel_execute(Some(23)).expect("transaction validation errors must be skipped");
     let (outcomes, _) = scheduler.take_result_and_state();
@@ -164,8 +170,14 @@ fn basefee_error_falls_back_and_continues_suffix() {
 
     let state = ParallelState::new(db, true, false);
     let env = BlockEnv { basefee: 100, ..Default::default() };
-    let scheduler =
-        Scheduler::new(CfgEnv::new_with_spec(SpecId::SHANGHAI), env, Arc::new(txs), state, None);
+    let scheduler = Scheduler::new_with_runtime_config(
+        CfgEnv::new_with_spec(SpecId::SHANGHAI),
+        env,
+        Arc::new(txs),
+        state,
+        None,
+        skip_invalid_config(),
+    );
     scheduler.parallel_execute(Some(23)).expect("basefee-invalid transaction must be skipped");
     let (outcomes, _) = scheduler.take_result_and_state();
 
@@ -187,12 +199,13 @@ fn nonce_overflow_from_parallel_commit_falls_back_and_continues_suffix() {
     txs[0].nonce = u64::MAX;
 
     let state = ParallelState::new(db, true, false);
-    let scheduler = Scheduler::new(
+    let scheduler = Scheduler::new_with_runtime_config(
         CfgEnv::new_with_spec(SpecId::SHANGHAI),
         BlockEnv::default(),
         Arc::new(txs),
         state,
         None,
+        skip_invalid_config(),
     );
     scheduler.parallel_execute(Some(23)).expect("nonce overflow must be skipped");
     let (outcomes, _) = scheduler.take_result_and_state();

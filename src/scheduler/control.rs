@@ -26,7 +26,8 @@ where
     /// # Errors
     ///
     /// Returns an error if this scheduler has already started, or if execution encounters a
-    /// database, fatal EVM, or scheduler invariant error. Invalid transactions are skipped.
+    /// database, fatal EVM, or scheduler invariant error. Invalid transaction behavior follows
+    /// [`crate::GrevmConfig::invalid_transaction_policy`].
     pub fn execute(&self) -> Result<(), GrevmError<DB::Error>> {
         self.parallel_execute(None)
     }
@@ -39,7 +40,8 @@ where
     /// # Errors
     ///
     /// Returns an error if this scheduler has already started, or if execution encounters a
-    /// database, fatal EVM, or scheduler invariant error. Invalid transactions are skipped.
+    /// database, fatal EVM, or scheduler invariant error. Invalid transaction behavior follows
+    /// [`crate::GrevmConfig::invalid_transaction_policy`].
     ///
     /// # Panics
     ///
@@ -84,7 +86,7 @@ where
     ) -> Result<(), GrevmError<DB::Error>> {
         // `committed` is the authoritative committed boundary. Abort metadata selects whether the
         // remaining suffix is replayed or an unrecoverable error is returned.
-        if self.is_aborted() {
+        if self.should_abort() {
             match self.abort_reason.get() {
                 Some(AbortReason::FatalEvmError(txid)) => {
                     let error = self.tx_results.get(*txid).and_then(|result| {
@@ -113,6 +115,11 @@ where
                 }
                 Some(AbortReason::FallbackSequential) => {
                     return self.replay_uncommitted_suffix(committed);
+                }
+                Some(AbortReason::Cancelled) => {
+                    return Err(GrevmError::cancelled(
+                        committed.index().min(self.block_size.saturating_sub(1)),
+                    ));
                 }
                 None => {
                     return self.fallback_after_parallel_error(
@@ -146,5 +153,22 @@ where
     #[inline]
     pub(super) fn is_aborted(&self) -> bool {
         self.abort.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(super) fn should_abort(&self) -> bool {
+        if self.is_aborted() {
+            return true
+        }
+        self.poll_cancellation()
+    }
+
+    #[inline]
+    pub(super) fn poll_cancellation(&self) -> bool {
+        if self.cancellation.as_ref().is_some_and(|is_cancelled| is_cancelled()) {
+            self.abort(AbortReason::Cancelled);
+            return true
+        }
+        false
     }
 }
