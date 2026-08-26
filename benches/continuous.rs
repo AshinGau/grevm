@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use grevm::{
-    ParallelState, ParallelTakeBundle, Scheduler,
+    ParallelState, Scheduler,
     test_utils::common::{execute, mainnet},
 };
 use revm_database::states::bundle_state::BundleRetention;
@@ -60,7 +60,7 @@ fn bench_continuous(c: &mut Criterion) {
                 );
                 executor.parallel_execute(None).unwrap();
                 let (_, mut inner) = executor.take_result_and_state();
-                let _ = inner.parallel_take_bundle(BundleRetention::Reverts);
+                let _ = inner.take_bundle_with_retention(BundleRetention::Reverts);
             })
         });
         group.bench_function("Origin Sequential", |b| {

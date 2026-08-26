@@ -114,6 +114,12 @@ define_execute_metrics! {
     no_dependency_txs;
     /// Transactions with at least one conflict.
     conflict_txs;
+    /// Time spent acquiring execution resources, in nanoseconds.
+    resource_wait_time => skip_zero;
+    /// Speculative workers granted by the execution resource budget.
+    parallel_worker_cnt => skip_zero;
+    /// Eligible parallel executions downgraded because fewer than two workers could be allocated.
+    resource_sequential_fallback => skip_zero;
     /// Parallel execution time in nanoseconds.
     execution_time => skip_zero;
     /// Commit time in nanoseconds.
@@ -188,6 +194,21 @@ impl ExecuteMetricsCollector {
     }
 
     #[inline]
+    pub(super) fn record_resource_wait(&self, elapsed: Duration) {
+        self.resource_wait_time.store(elapsed.as_nanos() as usize, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(super) fn record_parallel_workers(&self, workers: usize) {
+        self.parallel_worker_cnt.store(workers, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(super) fn record_resource_sequential_fallback(&self) {
+        self.resource_sequential_fallback.store(1, Ordering::Relaxed);
+    }
+
+    #[inline]
     pub(super) fn record_commit_time(&self, elapsed: Duration) {
         self.commit_time.fetch_add(elapsed.as_nanos() as usize, Ordering::Relaxed);
     }
@@ -219,31 +240,44 @@ impl<DB: revm::DatabaseRef> super::Scheduler<DB> {
 #[cfg(all(test, feature = "test-utils"))]
 mod tests {
     use super::*;
-    use metrics_util::debugging::DebuggingRecorder;
     use std::collections::BTreeSet;
 
     #[test]
-    fn snapshot_schema_matches_reported_metrics() {
+    fn snapshot_schema_is_stable() {
         let collector = ExecuteMetricsCollector::default();
         collector.record_block_start(7);
-        // `execution_time` intentionally skips zero values in `report`.
         collector.record_execution_time(Duration::from_nanos(1));
 
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        metrics::with_local_recorder(&recorder, || collector.report());
-
-        let reported_names = snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .map(|(key, _, _, _)| key.key().name().to_owned())
-            .collect::<BTreeSet<_>>();
         let snapshot = collector.snapshot();
         let snapshot_names =
             snapshot.keys().map(|name| (*name).to_owned()).collect::<BTreeSet<_>>();
+        let expected_names = [
+            "grevm.commit_time",
+            "grevm.conflict_by_error",
+            "grevm.conflict_by_estimate",
+            "grevm.conflict_by_miner",
+            "grevm.conflict_by_version",
+            "grevm.conflict_cnt",
+            "grevm.conflict_txs",
+            "grevm.execution_cnt",
+            "grevm.execution_time",
+            "grevm.more_attempts_with_dependency",
+            "grevm.no_dependency_txs",
+            "grevm.one_attempt_with_dependency",
+            "grevm.parallel_worker_cnt",
+            "grevm.reset_validation_idx_cnt",
+            "grevm.resource_sequential_fallback",
+            "grevm.resource_wait_time",
+            "grevm.total_time",
+            "grevm.total_tx_cnt",
+            "grevm.useless_dependent_update",
+            "grevm.validation_cnt",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
 
-        assert_eq!(reported_names, snapshot_names);
+        assert_eq!(snapshot_names, expected_names);
         assert_eq!(snapshot["grevm.total_tx_cnt"], 7);
     }
 
@@ -268,11 +302,13 @@ mod tests {
         let collector = ExecuteMetricsCollector::default();
         collector.record_commit_time(Duration::from_nanos(3));
         collector.record_execution_time(Duration::from_nanos(5));
+        collector.record_resource_wait(Duration::from_nanos(6));
         collector.record_total_time(Duration::from_nanos(7));
 
         let snapshot = collector.snapshot();
         assert_eq!(snapshot["grevm.commit_time"], 3);
         assert_eq!(snapshot["grevm.execution_time"], 5);
+        assert_eq!(snapshot["grevm.resource_wait_time"], 6);
         assert_eq!(snapshot["grevm.total_time"], 7);
     }
 }

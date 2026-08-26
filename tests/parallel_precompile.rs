@@ -3,9 +3,12 @@
 //! End-to-end tests for capability-restricted custom precompiles.
 
 use grevm::{
-    DelegatedSafetyConfig, DynParallelPrecompile, GrevmConfig, InvalidTransaction, ParallelState,
-    ParallelTakeBundle, Scheduler, TxExecutionOutcome,
-    test_utils::common::{account, execute, storage::InMemoryDB},
+    DelegatedSafetyConfig, DynParallelPrecompile, InvalidTransaction, InvalidTransactionPolicy,
+    ParallelState, Scheduler, SchedulerTuning, TxExecutionOutcome,
+    test_utils::{
+        common::{account, execute, storage::InMemoryDB},
+        execution_resources_for_workers, runtime_config_with_policies,
+    },
 };
 use revm::precompile::{PrecompileError, PrecompileHalt, PrecompileId, PrecompileOutput};
 use revm_context::{
@@ -208,23 +211,29 @@ fn execute_block(
     precompiles: Arc<Vec<(Address, DynParallelPrecompile)>>,
     force_sequential: bool,
 ) -> (Vec<TxExecutionOutcome>, BundleState, BTreeMap<&'static str, usize>) {
-    let scheduler = Scheduler::new_with_runtime_config(
+    let scheduler = Scheduler::try_new_with_runtime_config_and_resources(
         CfgEnv::new_with_spec(SpecId::SHANGHAI),
         BlockEnv { beneficiary: account::MINER_ADDRESS, ..Default::default() },
         Arc::new(txs),
         ParallelState::new(Arc::new(db), true, true),
         Some(precompiles),
-        GrevmConfig {
-            concurrency_level: 2,
-            force_sequential,
-            min_parallel_txs: 0,
-            delegated_safety: DelegatedSafetyConfig::disabled(),
-        },
-    );
+        runtime_config_with_policies(
+            SchedulerTuning { concurrency_level: 2, force_sequential, min_parallel_txs: 0 },
+            InvalidTransactionPolicy::IncludeNoop,
+            DelegatedSafetyConfig::disabled(),
+        ),
+        execution_resources_for_workers(2),
+    )
+    .expect("valid parallel-precompile test scheduler configuration");
     scheduler.execute().expect("block execution must succeed");
     let metrics = scheduler.metrics_snapshot();
+    if force_sequential {
+        assert_eq!(metrics["grevm.parallel_worker_cnt"], 0);
+    } else {
+        assert_eq!(metrics["grevm.parallel_worker_cnt"], 2);
+    }
     let (outcomes, mut state) = scheduler.take_result_and_state();
-    let bundle = state.parallel_take_bundle(BundleRetention::Reverts);
+    let bundle = state.take_bundle_with_retention(BundleRetention::Reverts);
     (outcomes, bundle, metrics)
 }
 
@@ -732,19 +741,20 @@ fn fatal_precompile_discards_its_parallel_incarnation_writes() {
             Err(PrecompileError::Fatal("injected fatal after state write".into()).into())
         },
     );
-    let scheduler = Scheduler::new_with_runtime_config(
+    let scheduler = Scheduler::try_new_with_runtime_config_and_resources(
         CfgEnv::new_with_spec(SpecId::SHANGHAI),
         BlockEnv { beneficiary: account::MINER_ADDRESS, ..Default::default() },
         Arc::new(vec![call_tx(0, fatal_precompile(), 1)]),
         ParallelState::new(Arc::new(db.clone()), true, true),
         Some(Arc::new(vec![(fatal_precompile(), precompile)])),
-        GrevmConfig {
-            concurrency_level: 2,
-            force_sequential: false,
-            min_parallel_txs: 0,
-            delegated_safety: DelegatedSafetyConfig::disabled(),
-        },
-    );
+        runtime_config_with_policies(
+            SchedulerTuning { concurrency_level: 2, force_sequential: false, min_parallel_txs: 0 },
+            InvalidTransactionPolicy::IncludeNoop,
+            DelegatedSafetyConfig::disabled(),
+        ),
+        execution_resources_for_workers(2),
+    )
+    .expect("valid fatal-precompile test scheduler configuration");
 
     let error = scheduler.execute().expect_err("the fatal precompile must abort execution");
     assert_eq!(error.txid, 0);
@@ -755,7 +765,7 @@ fn fatal_precompile_discards_its_parallel_incarnation_writes() {
 
     let (outcomes, mut state) = scheduler.take_result_and_state();
     assert!(outcomes.is_empty(), "a fatal tx cannot enter the committed outcome prefix");
-    let bundle = state.parallel_take_bundle(BundleRetention::Reverts);
+    let bundle = state.take_bundle_with_retention(BundleRetention::Reverts);
     assert_eq!(
         final_storage(&db, &bundle, state_holder(), SLOT_0),
         U256::from(OLD_VALUE),

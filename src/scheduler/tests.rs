@@ -1,15 +1,24 @@
 use super::*;
-use crate::{DelegatedSafetyConfig, InvalidTransaction, beneficiary::SpeculativeResult};
+use crate::{
+    DelegatedSafetyConfig, InvalidTransaction, InvalidTransactionPolicy,
+    beneficiary::SpeculativeResult,
+};
 use revm_context::{
     DBErrorMarker,
     result::{ExecutionResult, Output, ResultAndState, ResultGas, SuccessReason},
 };
 use revm_database::EmptyDB;
 use revm_primitives::{B256, Bytes, TxKind, U256, hardfork::SpecId};
-use revm_state::{AccountInfo, Bytecode};
+use revm_state::{Account, AccountInfo, Bytecode, EvmState};
 use std::{
     fmt::{Display, Formatter},
-    sync::Barrier,
+    num::NonZeroUsize,
+    sync::{
+        Arc as StdArc, Barrier,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,12 +88,14 @@ impl DatabaseRef for WorkerPanicDb {
 }
 
 fn empty_scheduler(num_txs: usize) -> Scheduler<EmptyDB> {
-    Scheduler::new(
+    Scheduler::new_with_runtime_config(
         CfgEnv::new_with_spec(SpecId::SHANGHAI),
         BlockEnv::default(),
         Arc::new(vec![TxEnv::default(); num_txs]),
         ParallelState::new(EmptyDB::default(), true, false),
         None,
+        GrevmConfig::default()
+            .with_invalid_transaction_policy(InvalidTransactionPolicy::IncludeNoop),
     )
 }
 
@@ -123,6 +134,111 @@ fn scheduler_returns_an_error_for_a_second_execution() {
 }
 
 #[test]
+fn scheduler_try_constructor_rejects_zero_concurrency() {
+    let config = GrevmConfig { concurrency_level: 0, ..GrevmConfig::default() };
+    let result = Scheduler::try_new_with_runtime_config(
+        CfgEnv::new_with_spec(SpecId::SHANGHAI),
+        BlockEnv::default(),
+        Arc::new(Vec::new()),
+        ParallelState::for_block(EmptyDB::default()),
+        None,
+        config,
+    );
+
+    assert!(matches!(result, Err(crate::GrevmConfigError::ZeroConcurrency)));
+}
+
+#[test]
+fn cancellation_is_distinguishable_in_parallel_and_sequential_modes() {
+    for force_sequential in [false, true] {
+        let cancelled = StdArc::new(AtomicBool::new(true));
+        let cancellation = cancelled.clone();
+        let scheduler = Scheduler::new_with_runtime_config(
+            CfgEnv::new_with_spec(SpecId::SHANGHAI),
+            BlockEnv::default(),
+            Arc::new(vec![TxEnv::default()]),
+            ParallelState::new(EmptyDB::default(), true, false),
+            None,
+            GrevmConfig {
+                concurrency_level: 1,
+                force_sequential,
+                min_parallel_txs: 0,
+                invalid_transaction_policy: InvalidTransactionPolicy::IncludeNoop,
+                delegated_safety: DelegatedSafetyConfig::default(),
+            },
+        )
+        .with_cancellation(move || cancellation.load(Ordering::Relaxed));
+
+        let error = scheduler.execute().expect_err("cancelled execution must stop");
+        assert!(error.is_cancelled());
+        let (outcomes, _) = scheduler.take_result_and_state();
+        assert!(outcomes.is_empty());
+    }
+}
+
+#[test]
+fn typed_cancellation_survives_an_earlier_fallback_abort_reason() {
+    let scheduler = empty_scheduler(1);
+    scheduler.abort(AbortReason::FallbackSequential);
+    let polls = AtomicUsize::new(0);
+
+    let result = scheduler.execute_with_typed_cancellation(|| {
+        // The preflight continues; sequential replay observes the interruption.
+        polls.fetch_add(1, Ordering::AcqRel) > 0
+    });
+
+    assert!(matches!(result, Err(control::SchedulerExecutionError::Interrupted)));
+    assert!(matches!(scheduler.abort_reason.get(), Some(AbortReason::FallbackSequential)));
+}
+
+#[test]
+fn installed_cancellation_uses_short_coordinator_polling() {
+    let scheduler = empty_scheduler(0);
+    assert_eq!(scheduler.coordinator_wait_timeout(None), STALL_TIMEOUT);
+
+    let cancelled = StdArc::new(AtomicBool::new(false));
+    let callback_cancelled = cancelled.clone();
+    let callback_polls = StdArc::new(AtomicUsize::new(0));
+    let observed_polls = callback_polls.clone();
+    let (park_ready_tx, park_ready_rx) = mpsc::channel();
+    let scheduler = empty_scheduler(1).with_cancellation(move || {
+        // Read before waking the canceller so this predicate remains blocked and the commit
+        // coordinator must rely on its polling timeout rather than a notification.
+        let is_cancelled = callback_cancelled.load(Ordering::Acquire);
+        if callback_polls.fetch_add(1, Ordering::AcqRel) == 2 {
+            park_ready_tx.send(()).expect("canceller must still be waiting");
+        }
+        is_cancelled
+    });
+    assert_eq!(scheduler.coordinator_wait_timeout(None), CANCELLATION_POLL_INTERVAL);
+    assert!(CANCELLATION_POLL_INTERVAL < STALL_TIMEOUT);
+
+    let canceller = std::thread::spawn(move || {
+        park_ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("commit coordinator did not reach its park predicate");
+        cancelled.store(true, Ordering::Release);
+    });
+
+    let mut state = scheduler.state.lock();
+    let (_, commit_state) = state.split_for_parallel();
+    let mut committer = OrderedCommitter::new(Address::ZERO, commit_state, false);
+    let started = Instant::now();
+    let run = scheduler.run_commit_loop(&mut committer, None);
+    let elapsed = started.elapsed();
+    canceller.join().expect("canceller thread");
+
+    assert!(run.error.is_none());
+    assert_eq!(run.committed.end(), CommittedPrefixEnd::ZERO);
+    assert!(matches!(scheduler.abort_reason.get(), Some(AbortReason::Cancelled)));
+    assert!(observed_polls.load(Ordering::Acquire) >= 4);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "installed cancellation was not observed promptly: {elapsed:?}"
+    );
+}
+
+#[test]
 fn speculative_worker_panic_cancels_peers_without_becoming_an_abort_reason() {
     let beneficiary = Address::from([0xCB; 20]);
     let caller = Address::from([0xCA; 20]);
@@ -134,18 +250,21 @@ fn speculative_worker_panic_cancels_peers_without_becoming_an_abort_reason() {
         ..Default::default()
     };
     let config =
-        GrevmConfig { concurrency_level: 1, min_parallel_txs: 0, ..GrevmConfig::default() };
-    let scheduler = Scheduler::new_with_runtime_config(
+        GrevmConfig { concurrency_level: 2, min_parallel_txs: 0, ..GrevmConfig::default() };
+    let resources = ExecutionResources::dedicated(NonZeroUsize::new(4).unwrap());
+    let scheduler = Scheduler::try_new_with_runtime_config_and_resources(
         CfgEnv::new_with_spec(SpecId::SHANGHAI),
         BlockEnv { beneficiary, ..Default::default() },
         Arc::new(vec![tx]),
         ParallelState::new(WorkerPanicDb { beneficiary }, true, false),
         None,
         config,
-    );
+        resources.clone(),
+    )
+    .unwrap();
 
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        scheduler.parallel_execute(Some(1))
+        scheduler.parallel_execute(Some(2))
     }))
     .expect_err("the original worker panic must reach the caller");
     assert_eq!(panic.downcast_ref::<&str>().copied(), Some("injected speculative worker panic"),);
@@ -154,6 +273,7 @@ fn speculative_worker_panic_cancels_peers_without_becoming_an_abort_reason() {
         scheduler.abort_reason.get().is_none(),
         "a panic must not masquerade as a recoverable execution error"
     );
+    assert_eq!(resources.available(), resources.capacity().get());
 }
 
 #[test]
@@ -168,6 +288,45 @@ fn fallback_then_execute_is_rejected_without_replaying_results() {
         EVMError::Custom(message) if message.contains("can execute only once")
     ));
     assert_eq!(scheduler.results.lock().len(), 1, "the block must not be executed twice");
+}
+
+#[test]
+fn explicit_sequential_fallback_obeys_the_execution_budget() {
+    let resources = ExecutionResources::dedicated(NonZeroUsize::MIN);
+    let mut occupied = Some(resources.acquire(None));
+    let scheduler = Scheduler::try_new_with_runtime_config_and_resources(
+        CfgEnv::new_with_spec(SpecId::SHANGHAI),
+        BlockEnv::default(),
+        Arc::new(Vec::new()),
+        ParallelState::for_block(EmptyDB::default()),
+        None,
+        GrevmConfig::default(),
+        resources.clone(),
+    )
+    .unwrap();
+    let (completed_tx, completed_rx) = mpsc::channel();
+
+    let (queued, blocked, completed) = std::thread::scope(|scope| {
+        scope.spawn(|| completed_tx.send(scheduler.fallback_sequential()).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut queued = true;
+        while resources.waiter_count() != 1 {
+            if Instant::now() >= deadline {
+                queued = false;
+                break
+            }
+            std::thread::yield_now();
+        }
+        let early = completed_rx.try_recv().ok();
+        let blocked = early.is_none();
+        drop(occupied.take());
+        let completed = early.or_else(|| completed_rx.recv_timeout(Duration::from_secs(1)).ok());
+        (queued, blocked, completed)
+    });
+
+    assert!(queued, "timed out waiting for execution resources");
+    assert!(blocked, "fallback completed before the held permit was released");
+    completed.expect("fallback did not complete after permit release").unwrap();
 }
 
 #[test]
@@ -258,8 +417,9 @@ fn fatal_execution_abort_uses_recorded_txid_not_finality_idx() {
     });
     scheduler.abort(AbortReason::FatalEvmError(2));
 
-    let error =
-        scheduler.post_execute(CommittedPrefixEnd::ZERO).expect_err("fatal abort must be returned");
+    let error = scheduler
+        .post_execute(CommittedPrefixEnd::ZERO, None)
+        .expect_err("fatal abort must be returned");
     assert_eq!(scheduler.scheduler_ctx.finality_idx(), 0);
     assert_eq!(error.txid, 2);
     assert!(matches!(
@@ -277,7 +437,7 @@ fn commit_abort_carries_error_without_using_tx_results() {
     }));
 
     let error = scheduler
-        .post_execute(CommittedPrefixEnd::ZERO)
+        .post_execute(CommittedPrefixEnd::ZERO, None)
         .expect_err("commit abort must be returned");
     assert_eq!(error.txid, 1);
     assert!(matches!(
@@ -288,6 +448,10 @@ fn commit_abort_carries_error_without_using_tx_results() {
 }
 
 fn successful_speculative_result() -> SpeculativeResult {
+    successful_speculative_result_with_state(EvmState::default())
+}
+
+fn successful_speculative_result_with_state(state: EvmState) -> SpeculativeResult {
     SpeculativeResult::settled(ResultAndState {
         result: ExecutionResult::Success {
             reason: SuccessReason::Stop,
@@ -295,8 +459,68 @@ fn successful_speculative_result() -> SpeculativeResult {
             logs: Vec::new(),
             output: Output::Call(Bytes::new()),
         },
-        state: Default::default(),
+        state,
     })
+}
+
+#[test]
+fn external_cancellation_retains_nonzero_committed_prefix() {
+    let cancelled = StdArc::new(AtomicBool::new(false));
+    let cancellation = cancelled.clone();
+    let scheduler =
+        empty_scheduler(2).with_cancellation(move || cancellation.load(Ordering::Acquire));
+    let mut changed_account = Account::from(AccountInfo::default());
+    changed_account.info.balance = U256::from(1);
+    changed_account.mark_touch();
+    let first_state: EvmState =
+        [(Address::with_last_byte(1), changed_account)].into_iter().collect();
+    for (index, tx_result) in scheduler.tx_results.iter().enumerate() {
+        *tx_result.lock() = Some(TransactionResult {
+            read_set: Default::default(),
+            write_set: Default::default(),
+            execute_result: Ok(if index == 0 {
+                successful_speculative_result_with_state(first_state.clone())
+            } else {
+                successful_speculative_result()
+            }),
+        });
+    }
+    scheduler.scheduler_ctx.publish_finality(2);
+
+    let run = {
+        let mut state = scheduler.state.lock();
+        let cancel_after_first_commit = cancelled.clone();
+        state.set_state_hook(Some(Box::new(move |_| {
+            cancel_after_first_commit.store(true, Ordering::Release);
+        })));
+        let (_, commit_state) = state.split_for_parallel();
+        let mut committer = OrderedCommitter::new(Address::ZERO, commit_state, false);
+        scheduler.run_commit_loop(&mut committer, None)
+    };
+
+    assert!(run.error.is_none());
+    assert_eq!(run.committed.end(), CommittedPrefixEnd::for_test(1));
+
+    let committed = scheduler
+        .install_commit_loop_result(run)
+        .expect("cancellation must preserve the installed prefix");
+    let error = scheduler.post_execute(committed, None).expect_err("cancellation must be reported");
+    assert!(error.is_cancelled());
+
+    assert!(scheduler.tx_results[1].lock().is_some());
+    let (outcomes, state) = scheduler.take_result_and_state();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(state.bal_index().get(), 1);
+}
+
+#[test]
+fn cancellation_is_reported_for_an_empty_sequential_execution() {
+    let scheduler = empty_scheduler(0).with_cancellation(|| true);
+
+    let error = scheduler.fallback_sequential().expect_err("cancellation must be reported");
+    assert!(error.is_cancelled());
+    let (outcomes, _) = scheduler.take_result_and_state();
+    assert!(outcomes.is_empty());
 }
 
 #[test]
@@ -322,7 +546,7 @@ fn ordered_commit_database_error_aborts_and_returns_exact_error() {
     let (_, commit_state) = state.split_for_parallel();
     let mut committer = OrderedCommitter::new(beneficiary, commit_state, false);
 
-    let run = scheduler.run_commit_loop(&mut committer);
+    let run = scheduler.run_commit_loop(&mut committer, None);
     let error = run.error.expect("commit must return DB error");
 
     assert_eq!(error.txid, 0);
@@ -364,7 +588,7 @@ fn ordered_commit_error_retains_the_successful_prefix() {
     let mut state = scheduler.state.lock();
     let (_, commit_state) = state.split_for_parallel();
     let mut committer = OrderedCommitter::new(beneficiary, commit_state, false);
-    let run = scheduler.run_commit_loop(&mut committer);
+    let run = scheduler.run_commit_loop(&mut committer, None);
 
     assert_eq!(run.committed.end(), CommittedPrefixEnd::for_test(1));
     assert_eq!(scheduler.scheduler_ctx.committed_idx(), 1);
@@ -388,6 +612,7 @@ fn execution_metrics_are_reported_once_for_sequential_and_error_paths() {
             concurrency_level: 1,
             force_sequential: true,
             min_parallel_txs: 0,
+            invalid_transaction_policy: InvalidTransactionPolicy::IncludeNoop,
             delegated_safety: DelegatedSafetyConfig::default(),
         },
     );
@@ -415,6 +640,7 @@ fn execution_metrics_are_reported_once_for_sequential_and_error_paths() {
             concurrency_level: 1,
             force_sequential: false,
             min_parallel_txs: 0,
+            invalid_transaction_policy: InvalidTransactionPolicy::IncludeNoop,
             delegated_safety: DelegatedSafetyConfig::default(),
         },
     );
@@ -429,7 +655,7 @@ fn execution_metrics_are_reported_once_for_sequential_and_error_paths() {
 fn parallel_error_replays_suffix_from_committed_prefix() {
     let caller = Address::from([0xCA; 20]);
     let receiver = Address::from([0xCB; 20]);
-    let state = ParallelState::new(EmptyDB::default(), true, false);
+    let mut state = ParallelState::new(EmptyDB::default(), true, false);
     state.insert_account(
         caller,
         AccountInfo { balance: U256::from(1_000_000), nonce: 1, ..Default::default() },
@@ -457,7 +683,7 @@ fn parallel_error_replays_suffix_from_committed_prefix() {
         .abort(AbortReason::ParallelError { txid: 0, message: "test parallel invariant failure" });
 
     scheduler
-        .post_execute(CommittedPrefixEnd::for_test(1))
+        .post_execute(CommittedPrefixEnd::for_test(1), None)
         .expect("sequential suffix replay must succeed");
     let results = scheduler.results.lock();
     assert_eq!(results.len(), 2);
@@ -471,7 +697,7 @@ fn parallel_error_replays_suffix_from_committed_prefix() {
 #[test]
 fn precompile_reads_are_incarnation_stable_and_conflicts_retry() {
     use crate::{
-        DynParallelPrecompile, ParallelTakeBundle,
+        DynParallelPrecompile,
         test_utils::common::{account, storage::InMemoryDB},
     };
     use revm::precompile::{PrecompileId, PrecompileOutput};
@@ -582,7 +808,7 @@ fn precompile_reads_are_incarnation_stable_and_conflicts_retry() {
         nonce: 1,
         ..Default::default()
     };
-    let scheduler = Scheduler::new_with_runtime_config(
+    let scheduler = Scheduler::try_new_with_runtime_config_and_resources(
         CfgEnv::new_with_spec(SpecId::SHANGHAI),
         BlockEnv { beneficiary: account::MINER_ADDRESS, ..Default::default() },
         Arc::new(vec![tx(0, writer_precompile), tx(1, reader_precompile)]),
@@ -592,9 +818,12 @@ fn precompile_reads_are_incarnation_stable_and_conflicts_retry() {
             concurrency_level: 2,
             force_sequential: false,
             min_parallel_txs: 0,
+            invalid_transaction_policy: InvalidTransactionPolicy::IncludeNoop,
             delegated_safety: DelegatedSafetyConfig::disabled(),
         },
-    );
+        ExecutionResources::dedicated(NonZeroUsize::new(4).unwrap()),
+    )
+    .unwrap();
 
     let (reader_started, writer_committed, execution) = std::thread::scope(|scope| {
         let execution = scope.spawn(|| scheduler.execute());
@@ -643,7 +872,7 @@ fn precompile_reads_are_incarnation_stable_and_conflicts_retry() {
         outcome,
         TxExecutionOutcome::Executed(ExecutionResult::Success { .. })
     )));
-    let bundle = state.parallel_take_bundle(BundleRetention::Reverts);
+    let bundle = state.take_bundle_with_retention(BundleRetention::Reverts);
     let holder = bundle.state.get(&holder).expect("state holder must be updated");
     assert_eq!(holder.storage_slot(input_slot), Some(U256::from(NEW_VALUE)));
     assert_eq!(holder.storage_slot(output_slot), Some(U256::from(NEW_VALUE)));

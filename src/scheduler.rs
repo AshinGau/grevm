@@ -13,15 +13,18 @@ mod executor;
 mod fallback;
 mod metrics;
 mod ordered_commit;
+pub(crate) mod session;
 #[cfg(test)]
 mod tests;
 mod wait;
 
 use crate::{
-    AbortReason, GrevmConfig, GrevmError, LocationAndType, MVMemory, ParallelState, ReadVersion,
-    Task, TransactionResult, TransactionStatus, TxExecutionOutcome, TxId, TxState, TxVersion,
+    AbortReason, ExecutionResources, GrevmConfig, GrevmError, LocationAndType, MVMemory,
+    ParallelState, ReadVersion, Task, TransactionResult, TransactionStatus, TxExecutionOutcome,
+    TxId, TxState, TxVersion,
     beneficiary::Beneficiary,
     delegated_safety::ReservePlanner,
+    execution_resources::ExecutionAllocation,
     incarnation_db::{IncarnationAccesses, IncarnationDb},
     tx_dependency::TxDependency,
 };
@@ -48,6 +51,9 @@ use wait::WaitSlot;
 pub(crate) use cursor::PublishedCursorReader;
 
 const STALL_TIMEOUT: Duration = Duration::from_secs(8);
+const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+type CancellationCheck<'a> = Option<&'a (dyn Fn() -> bool + Send + Sync)>;
 
 struct CommitLoopResult<DBError> {
     committed: OrderedCommitOutput,
@@ -79,10 +85,15 @@ where
     /// documented on [`Scheduler::new`].
     custom_precompiles: Arc<Vec<(Address, crate::DynParallelPrecompile)>>,
     config: GrevmConfig,
+    resources: ExecutionResources,
     reserve_planner: Option<Arc<ReservePlanner>>,
+    cancellation: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 
     started: AtomicBool,
     abort: AtomicBool,
+    /// Set only when a caller-provided cancellation check requests interruption. This keeps the
+    /// typed session API independent of the legacy string representation in [`GrevmError`].
+    interrupted: AtomicBool,
     abort_reason: OnceLock<AbortReason<DB::Error>>,
     finality_wait: WaitSlot,
     commit_wait: WaitSlot,
@@ -145,10 +156,18 @@ where
     /// only through journal-aware operations, so account lifecycle flags, read-your-writes,
     /// conflict tracking, and rollback remain visible to Grevm. Read-only access to immutable
     /// block-scoped data is also safe. A precompile must not keep mutable consensus state in its
-    /// shared closure or mutate account/storage state through any out-of-band handle.
+    /// shared closure or mutate account/storage state through any out-of-band handle. It must also
+    /// not synchronously invoke another scheduler that shares this scheduler's
+    /// [`ExecutionResources`], because the nested acquisition can deadlock behind the outer
+    /// scheduler's permit.
     ///
     /// This is an integration invariant and is not enforced at runtime. Custom precompiles that do
     /// not satisfy it must not be supplied to the parallel scheduler.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `GREVM_CONCURRENT_LEVEL` parses as zero. Production integrations should prefer
+    /// [`Self::try_new_with_runtime_config`] with an explicitly validated configuration.
     pub fn new(
         cfg: CfgEnv,
         env: BlockEnv,
@@ -181,8 +200,57 @@ where
         custom_precompiles: Option<Arc<Vec<(Address, crate::DynParallelPrecompile)>>>,
         config: GrevmConfig,
     ) -> Self {
-        assert!(config.concurrency_level > 0, "grevm concurrency level must be greater than zero");
-        Self::build(cfg, env, txs, state, custom_precompiles, config)
+        Self::try_new_with_runtime_config(cfg, env, txs, state, custom_precompiles, config)
+            .expect("grevm concurrency level must be greater than zero")
+    }
+
+    /// Tries to create a scheduler with an explicit, block-scoped runtime configuration.
+    ///
+    /// `custom_precompiles` is subject to the retry-safety contract documented on [`Self::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::GrevmConfigError`] when `config` violates scheduler invariants.
+    pub fn try_new_with_runtime_config(
+        cfg: CfgEnv,
+        env: BlockEnv,
+        txs: Arc<Vec<TxEnv>>,
+        state: ParallelState<DB>,
+        custom_precompiles: Option<Arc<Vec<(Address, crate::DynParallelPrecompile)>>>,
+        config: GrevmConfig,
+    ) -> Result<Self, crate::GrevmConfigError> {
+        Self::try_new_with_runtime_config_and_resources(
+            cfg,
+            env,
+            txs,
+            state,
+            custom_precompiles,
+            config,
+            ExecutionResources::process_default(),
+        )
+    }
+
+    /// Tries to create a scheduler with explicit runtime configuration and execution resources.
+    ///
+    /// Use a dedicated resource budget only when the embedding application intentionally isolates
+    /// GREVM work. Normal integrations should share [`ExecutionResources::process_default`]
+    /// through [`Self::try_new_with_runtime_config`].
+    /// `custom_precompiles` is subject to the retry-safety contract documented on [`Self::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::GrevmConfigError`] when `config` violates scheduler invariants.
+    pub fn try_new_with_runtime_config_and_resources(
+        cfg: CfgEnv,
+        env: BlockEnv,
+        txs: Arc<Vec<TxEnv>>,
+        state: ParallelState<DB>,
+        custom_precompiles: Option<Arc<Vec<(Address, crate::DynParallelPrecompile)>>>,
+        config: GrevmConfig,
+        resources: ExecutionResources,
+    ) -> Result<Self, crate::GrevmConfigError> {
+        config.validate()?;
+        Ok(Self::build(cfg, env, txs, state, custom_precompiles, config, resources))
     }
 
     fn build(
@@ -192,6 +260,7 @@ where
         state: ParallelState<DB>,
         custom_precompiles: Option<Arc<Vec<(Address, crate::DynParallelPrecompile)>>>,
         mut config: GrevmConfig,
+        resources: ExecutionResources,
     ) -> Self {
         let num_txs = txs.len();
         // The configuration may be shared across historical and current blocks. EIP-7702 safety
@@ -217,9 +286,12 @@ where
             scheduler_ctx: SchedulerContext::new(num_txs),
             custom_precompiles: custom_precompiles.unwrap_or_else(|| Arc::new(Vec::new())),
             config,
+            resources,
             reserve_planner,
+            cancellation: None,
             started: AtomicBool::new(false),
             abort: AtomicBool::new(false),
+            interrupted: AtomicBool::new(false),
             abort_reason: OnceLock::new(),
             finality_wait: WaitSlot::new(),
             commit_wait: WaitSlot::new(),
@@ -227,21 +299,53 @@ where
         }
     }
 
+    /// Install a cooperative cancellation check for this execution.
+    ///
+    /// Scheduler roles poll the check while executing and waiting. Once it returns `true`, the
+    /// scheduler stops without replaying the uncommitted suffix and [`Self::execute`] returns a
+    /// cancellation error. The committed prefix remains available through
+    /// [`Self::take_result_and_state`].
+    #[must_use]
+    pub fn with_cancellation(
+        mut self,
+        cancellation: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.cancellation = Some(Arc::new(cancellation));
+        self
+    }
+
+    fn coordinator_wait_timeout(&self, cancellation: CancellationCheck<'_>) -> Duration {
+        // External cancellation cannot notify these slots, so coordinators must wake periodically
+        // to poll it. Without an external check, retain the longer stall timeout and avoid idle
+        // wakeups.
+        if cancellation.is_some() || self.cancellation.is_some() {
+            CANCELLATION_POLL_INTERVAL
+        } else {
+            STALL_TIMEOUT
+        }
+    }
+
     /// Advance the exclusive end of the contiguous stable prefix.
     ///
     /// A transaction becomes final only while it is `Unconfirmed` and its validation timestamp is
     /// newer than every validation rewind affecting this prefix. Finality never skips an index.
-    fn run_finality_loop(&self) {
+    fn run_finality_loop(&self, cancellation: CancellationCheck<'_>) {
         self.finality_wait.register_current_thread();
         let mut last_progress = Instant::now();
         let mut finality_idx = 0;
         let mut lower_ts = 0;
         let dependency_distance = self.metrics.dependency_distance_histogram();
-        while !self.is_aborted() && finality_idx < self.block_size {
+        while !self.should_abort(cancellation) && finality_idx < self.block_size {
             let previous_finality_idx = finality_idx;
-            while let Some((mut tx_state, effective_lower_ts)) =
-                self.lock_finality_candidate(finality_idx, lower_ts)
-            {
+            loop {
+                if self.should_abort(cancellation) {
+                    break
+                }
+                let Some((mut tx_state, effective_lower_ts)) =
+                    self.lock_finality_candidate(finality_idx, lower_ts)
+                else {
+                    break
+                };
                 lower_ts = effective_lower_ts;
                 let incarnation = tx_state.incarnation;
                 let dependency = tx_state.dependency;
@@ -271,8 +375,8 @@ where
                 }
                 thread::yield_now();
             } else {
-                self.finality_wait.wait_while(STALL_TIMEOUT, || {
-                    !self.is_aborted() &&
+                self.finality_wait.wait_while(self.coordinator_wait_timeout(cancellation), || {
+                    !self.should_abort(cancellation) &&
                         self.lock_finality_candidate(finality_idx, lower_ts).is_none()
                 });
             }
@@ -319,13 +423,18 @@ where
     /// `commit_idx`, the ordered output end, and the published committed cursor describe the same
     /// exclusive prefix. `OrderedCommitter::commit` applies state, beneficiary rewards, and the
     /// outcome before this loop publishes that prefix.
-    fn run_commit_loop(&self, committer: &mut OrderedCommitter<DB>) -> CommitLoopResult<DB::Error> {
+    fn run_commit_loop(
+        &self,
+        committer: &mut OrderedCommitter<DB>,
+        cancellation: CancellationCheck<'_>,
+    ) -> CommitLoopResult<DB::Error> {
         self.commit_wait.register_current_thread();
         let mut output = OrderedCommitOutput::with_capacity(self.block_size);
         let mut commit_idx = 0;
-        while !self.is_aborted() && commit_idx < self.block_size {
+        while !self.should_abort(cancellation) && commit_idx < self.block_size {
             let previous_commit_idx = commit_idx;
-            while commit_idx < self.scheduler_ctx.finality_idx() {
+            while !self.should_abort(cancellation) && commit_idx < self.scheduler_ctx.finality_idx()
+            {
                 let Some(tx_result) = self.tx_results[commit_idx].lock().take() else {
                     self.abort(AbortReason::ParallelError {
                         txid: commit_idx,
@@ -372,8 +481,9 @@ where
             if commit_idx > previous_commit_idx {
                 thread::yield_now();
             } else {
-                self.commit_wait.wait_while(STALL_TIMEOUT, || {
-                    !self.is_aborted() && commit_idx >= self.scheduler_ctx.finality_idx()
+                self.commit_wait.wait_while(self.coordinator_wait_timeout(cancellation), || {
+                    !self.should_abort(cancellation) &&
+                        commit_idx >= self.scheduler_ctx.finality_idx()
                 });
             }
         }
@@ -404,14 +514,55 @@ where
         CancelOnPanic { scheduler: self }
     }
 
+    fn abort_on_parallel_start_failure(&self, role: &'static str, error: &impl std::fmt::Display) {
+        tracing::warn!(role, %error, "failed to start GREVM scheduler role; aborting parallel execution");
+        self.abort(AbortReason::FallbackSequential);
+    }
+
+    fn acquire_execution_resources(
+        &self,
+        desired_parallel_workers: Option<usize>,
+        cancellation: CancellationCheck<'_>,
+    ) -> Result<ExecutionAllocation, GrevmError<DB::Error>> {
+        let started = Instant::now();
+        let allocation = if cancellation.is_some() || self.cancellation.is_some() {
+            self.resources.acquire_with_cancellation(desired_parallel_workers, || {
+                self.poll_cancellation(cancellation)
+            })
+        } else {
+            Some(self.resources.acquire(desired_parallel_workers))
+        };
+        self.metrics.record_resource_wait(started.elapsed());
+        let Some(allocation) = allocation else {
+            return Err(GrevmError::cancelled(
+                self.scheduler_ctx.committed_idx().min(self.block_size.saturating_sub(1)),
+            ))
+        };
+        Ok(allocation)
+    }
+
     fn parallel_execute_inner(
         &self,
         concurrency_level: usize,
         start_time: Instant,
+        cancellation: CancellationCheck<'_>,
     ) -> Result<(), GrevmError<DB::Error>> {
-        if self.config.force_sequential || self.block_size < self.config.min_parallel_txs {
-            return self.replay_uncommitted_suffix(CommittedPrefixEnd::ZERO);
+        if self.poll_cancellation(cancellation) {
+            return Err(GrevmError::cancelled(0))
         }
+        let desired_parallel_workers = (!self.config.force_sequential &&
+            self.block_size >= self.config.min_parallel_txs)
+            .then_some(concurrency_level);
+        let mut allocation =
+            self.acquire_execution_resources(desired_parallel_workers, cancellation)?;
+        let ExecutionAllocation::Parallel { workers, .. } = &allocation else {
+            if desired_parallel_workers.is_some() {
+                self.metrics.record_resource_sequential_fallback();
+            }
+            return self.replay_uncommitted_suffix(CommittedPrefixEnd::ZERO, cancellation);
+        };
+        let concurrency_level = workers.get();
+        self.metrics.record_parallel_workers(concurrency_level);
         let commit_thread_result = {
             // Spawn `concurrency_level` speculative workers plus one finality coordinator and one
             // ordered commit thread. Workers and commit share the concurrent cache/database view;
@@ -433,37 +584,74 @@ where
                 // If spawning or joining itself panics, cancel children before `scope` waits for
                 // them. Each child has the same guard for panics in its scheduler role.
                 let _scope_cancel = self.cancel_on_panic();
-                let finality_thread = scope.spawn(|| {
-                    let _cancel = self.cancel_on_panic();
-                    self.run_finality_loop();
-                    self.metrics.record_execution_time(start_time.elapsed());
-                });
-                let commit_thread = scope.spawn(|| {
-                    let _cancel = self.cancel_on_panic();
-                    self.run_commit_loop(&mut committer)
-                });
-                let mut workers = Vec::with_capacity(concurrency_level);
-                for _ in 0..concurrency_level {
-                    workers.push(scope.spawn(|| {
+                let finality_thread = match thread::Builder::new()
+                    .name("grevm-finality".to_owned())
+                    .spawn_scoped(scope, || {
                         let _cancel = self.cancel_on_panic();
-                        let incarnation_db =
-                            IncarnationDb::new(&state_view, &self.mv_memory, &beneficiary);
-                        let mut cfg = self.cfg.clone();
-                        // Disable nonce checks during speculative execution. The commit thread
-                        // checks the nonce against committed state; a mismatch leaves the
-                        // transaction uncommitted and triggers sequential revalidation from that
-                        // transaction.
-                        cfg.disable_nonce_check = true;
-                        let mut executor = GrevmExecutor::new(
-                            incarnation_db,
-                            cfg,
-                            self.env.clone(),
-                            self.custom_precompiles.as_ref(),
-                            self.config.delegated_safety,
-                            self.reserve_planner.clone(),
-                        );
-                        self.run_worker(&mut executor, &beneficiary);
-                    }));
+                        self.run_finality_loop(cancellation);
+                        self.metrics.record_execution_time(start_time.elapsed());
+                    }) {
+                    Ok(thread) => thread,
+                    Err(error) => {
+                        self.abort_on_parallel_start_failure("finality", &error);
+                        return CommitLoopResult {
+                            committed: OrderedCommitOutput::default(),
+                            error: None,
+                        }
+                    }
+                };
+                let commit_thread = match thread::Builder::new()
+                    .name("grevm-commit".to_owned())
+                    .spawn_scoped(scope, || {
+                        let _cancel = self.cancel_on_panic();
+                        self.run_commit_loop(&mut committer, cancellation)
+                    }) {
+                    Ok(thread) => thread,
+                    Err(error) => {
+                        self.abort_on_parallel_start_failure("commit", &error);
+                        if let Err(panic) = finality_thread.join() {
+                            resume_unwind(panic);
+                        }
+                        return CommitLoopResult {
+                            committed: OrderedCommitOutput::default(),
+                            error: None,
+                        }
+                    }
+                };
+                let mut workers = Vec::new();
+                if let Err(error) = workers.try_reserve_exact(concurrency_level) {
+                    self.abort_on_parallel_start_failure("worker handles", &error);
+                } else {
+                    for worker_id in 0..concurrency_level {
+                        match thread::Builder::new()
+                            .name(format!("grevm-worker-{worker_id}"))
+                            .spawn_scoped(scope, || {
+                                let _cancel = self.cancel_on_panic();
+                                let incarnation_db =
+                                    IncarnationDb::new(&state_view, &self.mv_memory, &beneficiary);
+                                let mut cfg = self.cfg.clone();
+                                // Disable nonce checks during speculative execution. The commit
+                                // thread checks the nonce against committed state; a mismatch
+                                // leaves the transaction uncommitted and triggers sequential
+                                // revalidation from that transaction.
+                                cfg.disable_nonce_check = true;
+                                let mut executor = GrevmExecutor::new(
+                                    incarnation_db,
+                                    cfg,
+                                    self.env.clone(),
+                                    self.custom_precompiles.as_ref(),
+                                    self.config.delegated_safety,
+                                    self.reserve_planner.clone(),
+                                );
+                                self.run_worker(&mut executor, &beneficiary, cancellation);
+                            }) {
+                            Ok(worker) => workers.push(worker),
+                            Err(error) => {
+                                self.abort_on_parallel_start_failure("worker", &error);
+                                break
+                            }
+                        }
+                    }
                 }
 
                 // Join every role explicitly. `thread::scope` otherwise replaces an automatically
@@ -494,9 +682,12 @@ where
                 commit_result.expect("commit result exists when no scheduler thread panicked")
             })
         };
+        // Every spawned role has joined. Keep only the caller's sequential slot while installing
+        // the prefix and, when necessary, replaying the authoritative suffix.
+        allocation.retain_sequential_role();
         let committed = self.install_commit_loop_result(commit_thread_result)?;
         // Recover or replay from the authoritative committed boundary recorded above.
-        self.post_execute(committed)?;
+        self.post_execute(committed, cancellation)?;
         Ok(())
     }
 
@@ -508,17 +699,18 @@ where
         &self,
         executor: &mut impl ParallelTransactionExecutor<WorkerDB>,
         beneficiary: &Beneficiary,
+        cancellation: CancellationCheck<'_>,
     ) where
         WorkerDB: DatabaseRef<Error = DB::Error>,
     {
-        let mut task = self.next();
+        let mut task = self.next(cancellation);
         while let Some(current_task) = task {
             task = match current_task {
                 Task::Execution(version) => self.execute_task(executor, beneficiary, version),
                 Task::Validation(version) => self.validate(beneficiary, version),
             };
-            if task.is_none() && !self.is_aborted() {
-                task = self.next();
+            if task.is_none() && !self.should_abort(cancellation) {
+                task = self.next(cancellation);
             }
         }
     }
@@ -832,8 +1024,8 @@ where
         }
     }
 
-    fn next(&self) -> Option<Task> {
-        while !self.scheduler_ctx.finished() && !self.is_aborted() {
+    fn next(&self, cancellation: CancellationCheck<'_>) -> Option<Task> {
+        while !self.scheduler_ctx.finished() && !self.should_abort(cancellation) {
             if !self.scheduler_ctx.should_schedule(self.tx_dependency.index()) {
                 thread::yield_now();
             }

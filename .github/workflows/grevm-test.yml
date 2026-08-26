@@ -36,8 +36,9 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --all-features --all-targets -- -D warnings
 
-      # GREVM_MIN_PARALLEL_TXS=0 forces the parallel path for the (often small) replayed mainnet
-      # blocks so the parallel-vs-sequential comparison is actually exercised.
+      # GREVM_MIN_PARALLEL_TXS=0 makes the (often small) replayed mainnet blocks eligible for the
+      # parallel path. Differential test helpers inject an isolated role budget so low-core CI
+      # runners still exercise Block-STM rather than silently selecting sequential execution.
       - name: Run tests
         env:
           GREVM_MIN_PARALLEL_TXS: "0"

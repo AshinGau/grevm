@@ -4,9 +4,11 @@
 //! prefix; successful and invalid transactions extend it, while a fatal error preserves the
 //! completed portion for the caller.
 
-use super::{Scheduler, executor::build_evm, ordered_commit::CommittedPrefixEnd};
+use super::{
+    CancellationCheck, Scheduler, executor::build_evm, ordered_commit::CommittedPrefixEnd,
+};
 use crate::{
-    GrevmError, InvalidTransaction, TxExecutionOutcome, TxId,
+    GrevmError, InvalidTransaction, InvalidTransactionPolicy, TxExecutionOutcome, TxId,
     beneficiary::BeneficiaryMode,
     delegated_safety::{GrevmHandler, ReserveMode},
 };
@@ -21,6 +23,12 @@ struct SequentialReplayOutput<DBError> {
     error: Option<GrevmError<DBError>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NonFatalInvalidLogLevel {
+    Trace,
+    Debug,
+}
+
 impl<DB> Scheduler<DB>
 where
     DB: DatabaseRef + Send + Sync,
@@ -31,6 +39,7 @@ where
         committed: CommittedPrefixEnd,
         txid: TxId,
         message: &str,
+        cancellation: CancellationCheck<'_>,
     ) -> Result<(), GrevmError<DB::Error>> {
         tracing::error!(
             target: "grevm::scheduler",
@@ -39,7 +48,7 @@ where
             reason = message,
             "parallel execution invariant failed; falling back to sequential execution",
         );
-        self.replay_uncommitted_suffix(committed)
+        self.replay_uncommitted_suffix(committed, cancellation)
     }
 
     /// Execute the uncommitted block suffix sequentially.
@@ -47,14 +56,19 @@ where
     /// # Errors
     ///
     /// Returns an error if this scheduler has already started, or if replay encounters a database
-    /// or fatal EVM error. Invalid transactions are recorded as skipped outcomes.
+    /// or fatal EVM error. Invalid transaction behavior follows
+    /// [`crate::GrevmConfig::invalid_transaction_policy`].
     pub fn fallback_sequential(&self) -> Result<(), GrevmError<DB::Error>> {
-        self.run_once(|_| self.replay_uncommitted_suffix(CommittedPrefixEnd::ZERO))
+        self.run_once(|_| {
+            let _allocation = self.acquire_execution_resources(None, None)?;
+            self.replay_uncommitted_suffix(CommittedPrefixEnd::ZERO, None)
+        })
     }
 
     pub(super) fn replay_uncommitted_suffix(
         &self,
         committed: CommittedPrefixEnd,
+        cancellation: CancellationCheck<'_>,
     ) -> Result<(), GrevmError<DB::Error>> {
         let start = committed.index();
         let result_count = self.results.lock().len();
@@ -69,6 +83,9 @@ where
                     self.block_size,
                 )),
             });
+        }
+        if self.poll_cancellation(cancellation) {
+            return Err(GrevmError::cancelled(start.min(self.block_size.saturating_sub(1))));
         }
         if start == self.block_size {
             return Ok(());
@@ -85,42 +102,90 @@ where
             );
             // The planner describes the full block, so replay retains global TxIds rather than
             // rebasing future-cost lookups at `start`.
-            self.execute_sequential_suffix(start, |txid, tx| {
-                reject_nonce_overflow(evm.db_mut(), self.cfg.disable_nonce_check, tx)?;
-                evm.ctx.set_tx(tx.clone());
-                let reserve_mode = ReserveMode::from_planner(txid, self.reserve_planner.as_deref());
-                let output =
-                    GrevmHandler::new(reserve_mode, BeneficiaryMode::Immediate).run(&mut evm);
+            self.execute_sequential_suffix(start, cancellation, |txid, tx| {
+                let output = reject_nonce_overflow(evm.db_mut(), self.cfg.disable_nonce_check, tx)
+                    .and_then(|()| {
+                        evm.ctx.set_tx(tx.clone());
+                        let reserve_mode =
+                            ReserveMode::from_planner(txid, self.reserve_planner.as_deref());
+                        GrevmHandler::new(reserve_mode, BeneficiaryMode::Immediate).run(&mut evm)
+                    });
                 let state = evm.finalize();
-                output.map(|output| {
-                    let result = output.into_immediate_result();
-                    evm.db_mut().commit(state);
-                    result
-                })
+                match output {
+                    Ok(output) => {
+                        let result = output.into_immediate_result();
+                        evm.db_mut().commit(state);
+                        evm.db_mut().bump_bal_index();
+                        Ok(result)
+                    }
+                    Err(EVMError::Transaction(error)) => {
+                        if self.config.invalid_transaction_policy ==
+                            InvalidTransactionPolicy::IncludeNoop
+                        {
+                            evm.db_mut().bump_bal_index();
+                        }
+                        Err(EVMError::Transaction(error))
+                    }
+                    Err(error) => Err(error),
+                }
             })
         };
         let SequentialReplayOutput { outcomes, error } = replay;
         self.results.lock().extend(outcomes);
-        error.map_or(Ok(()), Err)
+        if let Some(error) = error {
+            return Err(error)
+        }
+        if self.poll_cancellation(cancellation) {
+            return Err(GrevmError::cancelled(self.block_size.saturating_sub(1)))
+        }
+        Ok(())
     }
 
     fn execute_sequential_suffix(
         &self,
         start: TxId,
+        cancellation: CancellationCheck<'_>,
         mut transact: impl FnMut(TxId, &TxEnv) -> Result<ExecutionResult, EVMError<DB::Error>>,
     ) -> SequentialReplayOutput<DB::Error> {
         let mut outcomes = Vec::with_capacity(self.block_size - start);
         for txid in start..self.block_size {
+            // Internal abort reasons are what route execution into this recovery loop. Only an
+            // external cancellation should interrupt suffix replay.
+            if self.poll_cancellation(cancellation) {
+                return SequentialReplayOutput {
+                    outcomes,
+                    error: Some(GrevmError::cancelled(txid)),
+                };
+            }
             let outcome = match transact(txid, &self.txs[txid]) {
                 Ok(result) => TxExecutionOutcome::Executed(result),
+                Err(EVMError::Transaction(error))
+                    if self.config.invalid_transaction_policy ==
+                        InvalidTransactionPolicy::Abort =>
+                {
+                    return SequentialReplayOutput {
+                        outcomes,
+                        error: Some(GrevmError { txid, error: EVMError::Transaction(error) }),
+                    };
+                }
                 Err(EVMError::Transaction(error)) => {
-                    tracing::error!(
-                        target: "grevm::scheduler",
-                        block_number = %self.env.number,
-                        txid,
-                        ?error,
-                        "skipping invalid transaction during sequential fallback",
-                    );
+                    match non_fatal_invalid_log_level(self.config.invalid_transaction_policy) {
+                        Some(NonFatalInvalidLogLevel::Trace) => tracing::trace!(
+                            target: "grevm::scheduler",
+                            block_number = %self.env.number,
+                            txid,
+                            ?error,
+                            "omitting invalid transaction candidate during sequential fallback",
+                        ),
+                        Some(NonFatalInvalidLogLevel::Debug) => tracing::debug!(
+                            target: "grevm::scheduler",
+                            block_number = %self.env.number,
+                            txid,
+                            ?error,
+                            "retaining invalid transaction as a no-op during sequential fallback",
+                        ),
+                        None => unreachable!("abort policy returned from the preceding branch"),
+                    }
                     TxExecutionOutcome::Skipped(error)
                 }
                 Err(error) => {
@@ -134,6 +199,16 @@ where
             self.metrics.record_execution_attempt();
         }
         SequentialReplayOutput { outcomes, error: None }
+    }
+}
+
+const fn non_fatal_invalid_log_level(
+    policy: InvalidTransactionPolicy,
+) -> Option<NonFatalInvalidLogLevel> {
+    match policy {
+        InvalidTransactionPolicy::Abort => None,
+        InvalidTransactionPolicy::Omit => Some(NonFatalInvalidLogLevel::Trace),
+        InvalidTransactionPolicy::IncludeNoop => Some(NonFatalInvalidLogLevel::Debug),
     }
 }
 
@@ -156,7 +231,7 @@ fn reject_nonce_overflow<DB: DatabaseRef>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ParallelState;
+    use crate::{GrevmConfig, ParallelState};
     use revm_context::{
         BlockEnv, CfgEnv,
         result::{Output, ResultGas, SuccessReason},
@@ -174,20 +249,28 @@ mod tests {
         }
     }
 
-    fn scheduler(num_txs: usize) -> Scheduler<EmptyDB> {
-        Scheduler::new(
+    fn scheduler_with_policy(
+        num_txs: usize,
+        policy: InvalidTransactionPolicy,
+    ) -> Scheduler<EmptyDB> {
+        Scheduler::new_with_runtime_config(
             CfgEnv::new_with_spec(SpecId::SHANGHAI),
             BlockEnv::default(),
-            Arc::new(vec![TxEnv::default(); num_txs]),
+            Arc::new(vec![TxEnv { gas_limit: 1, ..Default::default() }; num_txs]),
             ParallelState::new(EmptyDB::default(), true, false),
             None,
+            GrevmConfig::default().with_invalid_transaction_policy(policy),
         )
+    }
+
+    fn scheduler(num_txs: usize) -> Scheduler<EmptyDB> {
+        scheduler_with_policy(num_txs, InvalidTransactionPolicy::IncludeNoop)
     }
 
     #[test]
     fn sequential_fatal_error_preserves_the_completed_prefix() {
         let scheduler = scheduler(3);
-        let replay = scheduler.execute_sequential_suffix(0, |txid, _| {
+        let replay = scheduler.execute_sequential_suffix(0, None, |txid, _| {
             if txid == 1 { Err(EVMError::Custom("fatal".to_owned())) } else { Ok(success()) }
         });
 
@@ -200,7 +283,7 @@ mod tests {
     #[test]
     fn skipped_transaction_still_advances_the_replay_prefix() {
         let scheduler = scheduler(2);
-        let replay = scheduler.execute_sequential_suffix(0, |txid, _| {
+        let replay = scheduler.execute_sequential_suffix(0, None, |txid, _| {
             if txid == 0 {
                 Err(EVMError::Transaction(InvalidTransaction::NonceTooLow { tx: 0, state: 1 }))
             } else {
@@ -212,5 +295,40 @@ mod tests {
         assert_eq!(replay.outcomes.len(), 2);
         assert!(matches!(replay.outcomes[0], TxExecutionOutcome::Skipped(_)));
         assert!(matches!(replay.outcomes[1], TxExecutionOutcome::Executed(_)));
+    }
+
+    #[test]
+    fn invalid_policy_controls_error_and_bal_index_semantics() {
+        let abort = scheduler_with_policy(1, InvalidTransactionPolicy::Abort);
+        let error = abort.fallback_sequential().expect_err("strict blocks reject invalid txs");
+        assert!(matches!(error.error, EVMError::Transaction(_)));
+        let (outcomes, state) = abort.take_result_and_state();
+        assert!(outcomes.is_empty());
+        assert_eq!(state.bal_index().get(), 0);
+
+        let omit = scheduler_with_policy(1, InvalidTransactionPolicy::Omit);
+        omit.fallback_sequential().expect("builders omit invalid candidates");
+        let (outcomes, state) = omit.take_result_and_state();
+        assert!(matches!(outcomes.as_slice(), [TxExecutionOutcome::Skipped(_)]));
+        assert_eq!(state.bal_index().get(), 0);
+
+        let include = scheduler_with_policy(1, InvalidTransactionPolicy::IncludeNoop);
+        include.fallback_sequential().expect("noop protocols retain invalid positions");
+        let (outcomes, state) = include.take_result_and_state();
+        assert!(matches!(outcomes.as_slice(), [TxExecutionOutcome::Skipped(_)]));
+        assert_eq!(state.bal_index().get(), 1);
+    }
+
+    #[test]
+    fn non_fatal_invalid_policies_use_diagnostic_log_levels() {
+        assert_eq!(
+            non_fatal_invalid_log_level(InvalidTransactionPolicy::Omit),
+            Some(NonFatalInvalidLogLevel::Trace),
+        );
+        assert_eq!(
+            non_fatal_invalid_log_level(InvalidTransactionPolicy::IncludeNoop),
+            Some(NonFatalInvalidLogLevel::Debug),
+        );
+        assert_eq!(non_fatal_invalid_log_level(InvalidTransactionPolicy::Abort), None);
     }
 }
