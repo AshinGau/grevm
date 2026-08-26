@@ -21,6 +21,12 @@ struct SequentialReplayOutput<DBError> {
     error: Option<GrevmError<DBError>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NonFatalInvalidLogLevel {
+    Trace,
+    Debug,
+}
+
 impl<DB> Scheduler<DB>
 where
     DB: DatabaseRef + Send + Sync,
@@ -145,13 +151,23 @@ where
                     };
                 }
                 Err(EVMError::Transaction(error)) => {
-                    tracing::error!(
-                        target: "grevm::scheduler",
-                        block_number = %self.env.number,
-                        txid,
-                        ?error,
-                        "skipping invalid transaction during sequential fallback",
-                    );
+                    match non_fatal_invalid_log_level(self.config.invalid_transaction_policy) {
+                        Some(NonFatalInvalidLogLevel::Trace) => tracing::trace!(
+                            target: "grevm::scheduler",
+                            block_number = %self.env.number,
+                            txid,
+                            ?error,
+                            "omitting invalid transaction candidate during sequential fallback",
+                        ),
+                        Some(NonFatalInvalidLogLevel::Debug) => tracing::debug!(
+                            target: "grevm::scheduler",
+                            block_number = %self.env.number,
+                            txid,
+                            ?error,
+                            "retaining invalid transaction as a no-op during sequential fallback",
+                        ),
+                        None => unreachable!("abort policy returned from the preceding branch"),
+                    }
                     TxExecutionOutcome::Skipped(error)
                 }
                 Err(error) => {
@@ -165,6 +181,16 @@ where
             self.metrics.record_execution_attempt();
         }
         SequentialReplayOutput { outcomes, error: None }
+    }
+}
+
+const fn non_fatal_invalid_log_level(
+    policy: InvalidTransactionPolicy,
+) -> Option<NonFatalInvalidLogLevel> {
+    match policy {
+        InvalidTransactionPolicy::Abort => None,
+        InvalidTransactionPolicy::Omit => Some(NonFatalInvalidLogLevel::Trace),
+        InvalidTransactionPolicy::IncludeNoop => Some(NonFatalInvalidLogLevel::Debug),
     }
 }
 
@@ -273,5 +299,18 @@ mod tests {
         let (outcomes, state) = include.take_result_and_state();
         assert!(matches!(outcomes.as_slice(), [TxExecutionOutcome::Skipped(_)]));
         assert_eq!(state.bal_index().get(), 1);
+    }
+
+    #[test]
+    fn non_fatal_invalid_policies_use_diagnostic_log_levels() {
+        assert_eq!(
+            non_fatal_invalid_log_level(InvalidTransactionPolicy::Omit),
+            Some(NonFatalInvalidLogLevel::Trace),
+        );
+        assert_eq!(
+            non_fatal_invalid_log_level(InvalidTransactionPolicy::IncludeNoop),
+            Some(NonFatalInvalidLogLevel::Debug),
+        );
+        assert_eq!(non_fatal_invalid_log_level(InvalidTransactionPolicy::Abort), None);
     }
 }

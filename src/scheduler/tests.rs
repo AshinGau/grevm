@@ -14,8 +14,10 @@ use std::{
     fmt::{Display, Formatter},
     sync::{
         Arc as StdArc, Barrier,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     },
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,6 +158,53 @@ fn cancellation_is_distinguishable_in_parallel_and_sequential_modes() {
         let (outcomes, _) = scheduler.take_result_and_state();
         assert!(outcomes.is_empty());
     }
+}
+
+#[test]
+fn installed_cancellation_uses_short_coordinator_polling() {
+    let scheduler = empty_scheduler(0);
+    assert_eq!(scheduler.coordinator_wait_timeout(), STALL_TIMEOUT);
+
+    let cancelled = StdArc::new(AtomicBool::new(false));
+    let callback_cancelled = cancelled.clone();
+    let callback_polls = StdArc::new(AtomicUsize::new(0));
+    let observed_polls = callback_polls.clone();
+    let (park_ready_tx, park_ready_rx) = mpsc::channel();
+    let scheduler = empty_scheduler(1).with_cancellation(move || {
+        // Read before waking the canceller so this predicate remains blocked and the commit
+        // coordinator must rely on its polling timeout rather than a notification.
+        let is_cancelled = callback_cancelled.load(Ordering::Acquire);
+        if callback_polls.fetch_add(1, Ordering::AcqRel) == 2 {
+            park_ready_tx.send(()).expect("canceller must still be waiting");
+        }
+        is_cancelled
+    });
+    assert_eq!(scheduler.coordinator_wait_timeout(), CANCELLATION_POLL_INTERVAL);
+    assert!(CANCELLATION_POLL_INTERVAL < STALL_TIMEOUT);
+
+    let canceller = std::thread::spawn(move || {
+        park_ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("commit coordinator did not reach its park predicate");
+        cancelled.store(true, Ordering::Release);
+    });
+
+    let mut state = scheduler.state.lock();
+    let (_, commit_state) = state.split_for_parallel();
+    let mut committer = OrderedCommitter::new(Address::ZERO, commit_state, false);
+    let started = Instant::now();
+    let run = scheduler.run_commit_loop(&mut committer);
+    let elapsed = started.elapsed();
+    canceller.join().expect("canceller thread");
+
+    assert!(run.error.is_none());
+    assert_eq!(run.committed.end(), CommittedPrefixEnd::ZERO);
+    assert!(matches!(scheduler.abort_reason.get(), Some(AbortReason::Cancelled)));
+    assert!(observed_polls.load(Ordering::Acquire) >= 4);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "installed cancellation was not observed promptly: {elapsed:?}"
+    );
 }
 
 #[test]

@@ -48,6 +48,7 @@ use wait::WaitSlot;
 pub(crate) use cursor::PublishedCursorReader;
 
 const STALL_TIMEOUT: Duration = Duration::from_secs(8);
+const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 struct CommitLoopResult<DBError> {
     committed: OrderedCommitOutput,
@@ -244,6 +245,13 @@ where
         self
     }
 
+    fn coordinator_wait_timeout(&self) -> Duration {
+        // External cancellation cannot notify these slots, so coordinators must wake periodically
+        // to poll it. Without an external check, retain the longer stall timeout and avoid idle
+        // wakeups.
+        if self.cancellation.is_some() { CANCELLATION_POLL_INTERVAL } else { STALL_TIMEOUT }
+    }
+
     /// Advance the exclusive end of the contiguous stable prefix.
     ///
     /// A transaction becomes final only while it is `Unconfirmed` and its validation timestamp is
@@ -288,7 +296,7 @@ where
                 }
                 thread::yield_now();
             } else {
-                self.finality_wait.wait_while(STALL_TIMEOUT, || {
+                self.finality_wait.wait_while(self.coordinator_wait_timeout(), || {
                     !self.should_abort() &&
                         self.lock_finality_candidate(finality_idx, lower_ts).is_none()
                 });
@@ -389,7 +397,7 @@ where
             if commit_idx > previous_commit_idx {
                 thread::yield_now();
             } else {
-                self.commit_wait.wait_while(STALL_TIMEOUT, || {
+                self.commit_wait.wait_while(self.coordinator_wait_timeout(), || {
                     !self.should_abort() && commit_idx >= self.scheduler_ctx.finality_idx()
                 });
             }
