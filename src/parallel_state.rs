@@ -765,6 +765,14 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         self.state_hook = hook;
     }
 
+    /// Take the canonical state commit hook, leaving no hook installed.
+    ///
+    /// This is useful when an integration needs to perform metadata-only empty commits before
+    /// restoring the same hook for later consensus state changes.
+    pub fn take_state_hook(&mut self) -> Option<Box<dyn OnStateHook>> {
+        self.state_hook.take()
+    }
+
     /// Returns the size hint for the inner bundle state.
     /// See [BundleState::size_hint] for more info.
     pub fn bundle_size_hint(&self) -> usize {
@@ -1035,6 +1043,27 @@ mod tests {
         let info = state.basic_ref(address).unwrap().expect("committed account");
         assert_eq!(info.balance, U256::from(9));
         assert_eq!(state.storage_ref(address, U256::from(1)).unwrap(), U256::from(4));
+    }
+
+    #[test]
+    fn canonical_state_hook_can_be_suspended_and_restored() {
+        let address = Address::with_last_byte(0x23);
+        let ignored = changed_account_state(address, 7, 8, 3, 4);
+        let observed_state = changed_account_state(address, 8, 9, 4, 5);
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let hook_observed = observed.clone();
+        let mut state = ParallelState::new(EmptyDB::default(), true, false);
+        state.set_state_hook(Some(Box::new(move |state| {
+            hook_observed.lock().unwrap().push(state);
+        })));
+
+        let hook = state.take_state_hook();
+        state.commit(ignored);
+        assert!(observed.lock().unwrap().is_empty());
+
+        state.set_state_hook(hook);
+        state.commit(observed_state.clone());
+        assert_eq!(observed.lock().unwrap().as_slice(), &[observed_state]);
     }
 
     #[test]
