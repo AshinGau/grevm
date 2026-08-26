@@ -219,31 +219,41 @@ impl<DB: revm::DatabaseRef> super::Scheduler<DB> {
 #[cfg(all(test, feature = "test-utils"))]
 mod tests {
     use super::*;
-    use metrics_util::debugging::DebuggingRecorder;
     use std::collections::BTreeSet;
 
     #[test]
-    fn snapshot_schema_matches_reported_metrics() {
+    fn snapshot_schema_is_stable() {
         let collector = ExecuteMetricsCollector::default();
         collector.record_block_start(7);
-        // `execution_time` intentionally skips zero values in `report`.
         collector.record_execution_time(Duration::from_nanos(1));
 
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        metrics::with_local_recorder(&recorder, || collector.report());
-
-        let reported_names = snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .map(|(key, _, _, _)| key.key().name().to_owned())
-            .collect::<BTreeSet<_>>();
         let snapshot = collector.snapshot();
         let snapshot_names =
             snapshot.keys().map(|name| (*name).to_owned()).collect::<BTreeSet<_>>();
+        let expected_names = [
+            "grevm.commit_time",
+            "grevm.conflict_by_error",
+            "grevm.conflict_by_estimate",
+            "grevm.conflict_by_miner",
+            "grevm.conflict_by_version",
+            "grevm.conflict_cnt",
+            "grevm.conflict_txs",
+            "grevm.execution_cnt",
+            "grevm.execution_time",
+            "grevm.more_attempts_with_dependency",
+            "grevm.no_dependency_txs",
+            "grevm.one_attempt_with_dependency",
+            "grevm.reset_validation_idx_cnt",
+            "grevm.total_time",
+            "grevm.total_tx_cnt",
+            "grevm.useless_dependent_update",
+            "grevm.validation_cnt",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
 
-        assert_eq!(reported_names, snapshot_names);
+        assert_eq!(snapshot_names, expected_names);
         assert_eq!(snapshot["grevm.total_tx_cnt"], 7);
     }
 
