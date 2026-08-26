@@ -21,7 +21,6 @@
 //! reporting.
 mod account;
 mod beneficiary;
-mod bundle;
 mod concurrent_db;
 mod config;
 mod delegated_safety;
@@ -41,7 +40,6 @@ pub(crate) use model::{
     Task, TransactionResult, TransactionStatus, TxId, TxState, TxVersion,
 };
 
-pub use bundle::{ParallelBundleState, ParallelTakeBundle};
 pub use concurrent_db::{ConcurrentDatabase, DatabaseFactory, ReadCache};
 pub use config::{
     ExecutionProfile, GrevmConfig, GrevmConfigError, InvalidTransactionPolicy, SchedulerTuning,

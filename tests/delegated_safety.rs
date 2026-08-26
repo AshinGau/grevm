@@ -4,7 +4,7 @@
 
 use grevm::{
     DelegatedSafetyConfig, DynParallelPrecompile, InvalidTransaction, InvalidTransactionPolicy,
-    ParallelState, ParallelTakeBundle, Scheduler, SchedulerTuning, TxExecutionOutcome,
+    ParallelState, Scheduler, SchedulerTuning, TxExecutionOutcome,
     test_utils::{
         TRANSFER_GAS_LIMIT,
         common::{account, execute, storage::InMemoryDB},
@@ -306,7 +306,7 @@ fn execute_block_with_precompiles_and_spec(
     .expect("valid delegated-safety test scheduler configuration");
     scheduler.execute().expect("block execution failed");
     let (outcomes, mut state) = scheduler.take_result_and_state();
-    let bundle = state.parallel_take_bundle(BundleRetention::Reverts);
+    let bundle = state.take_bundle_with_retention(BundleRetention::Reverts);
     (outcomes, bundle)
 }
 

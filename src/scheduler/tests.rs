@@ -697,7 +697,7 @@ fn parallel_error_replays_suffix_from_committed_prefix() {
 #[test]
 fn precompile_reads_are_incarnation_stable_and_conflicts_retry() {
     use crate::{
-        DynParallelPrecompile, ParallelTakeBundle,
+        DynParallelPrecompile,
         test_utils::common::{account, storage::InMemoryDB},
     };
     use revm::precompile::{PrecompileId, PrecompileOutput};
@@ -872,7 +872,7 @@ fn precompile_reads_are_incarnation_stable_and_conflicts_retry() {
         outcome,
         TxExecutionOutcome::Executed(ExecutionResult::Success { .. })
     )));
-    let bundle = state.parallel_take_bundle(BundleRetention::Reverts);
+    let bundle = state.take_bundle_with_retention(BundleRetention::Reverts);
     let holder = bundle.state.get(&holder).expect("state holder must be updated");
     assert_eq!(holder.storage_slot(input_slot), Some(U256::from(NEW_VALUE)));
     assert_eq!(holder.storage_slot(output_slot), Some(U256::from(NEW_VALUE)));

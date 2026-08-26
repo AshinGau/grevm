@@ -21,7 +21,6 @@ revm-inspector = { version = "42.0.1", default-features = false }
 revm-context = { version = "42.0.0", default-features = false }
 
 ahash = "0.8"
-rayon = "1.10.0"
 parking_lot = "0.12"
 
 # Alloy — upstream (the `Galxe/alloy-evm` fork only repointed revm to the gravity fork and added a
@@ -55,7 +54,6 @@ revm = { version = "42.0.1", default-features = false, features = ["optional_fee
 # revme = { package = "revme", git = "https://github.com/Galxe/revm", branch = "v29.0.1-gravity", default-features = false }
 criterion = "0.5.1"
 walkdir = "2.5.0"
-rayon = "1.10.0"
 tikv-jemallocator = "0.6"
 bincode = "1.3.3"
 loom = "0.7"

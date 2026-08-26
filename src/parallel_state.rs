@@ -526,14 +526,13 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         }
     }
 
-    // TODO make cache aware of transitions dropping by having global transition counter.
-    /// Takes the accumulated [`BundleState`], replacing it with an empty one.
+    /// Finalizes pending transitions and takes the accumulated [`BundleState`].
     ///
-    /// This is a low-level, destructive operation: it does not apply or drain a pending
-    /// [`TransitionState`]. Call [`crate::ParallelTakeBundle::parallel_take_bundle`] when producing
-    /// a finalized block bundle; use this method directly only after transitions have already been
-    /// merged.
-    pub fn take_bundle(&mut self) -> BundleState {
+    /// Bundle materialization deliberately uses revm's canonical serial merge. Running this phase
+    /// on a global thread pool would bypass [`crate::ExecutionResources`] and could oversubscribe
+    /// the process when several payload, validation, or history jobs finish concurrently.
+    pub fn take_bundle_with_retention(&mut self, retention: BundleRetention) -> BundleState {
+        self.merge_transitions(retention);
         core::mem::take(&mut self.bundle_state)
     }
 

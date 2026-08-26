@@ -17,10 +17,7 @@ error type is `Clone + Send + Sync + 'static`.
 ```rust
 use std::sync::Arc;
 
-use grevm::{
-    GrevmConfig, ParallelState, ParallelTakeBundle, Scheduler, SchedulerTuning,
-    TxExecutionOutcome,
-};
+use grevm::{GrevmConfig, ParallelState, Scheduler, SchedulerTuning, TxExecutionOutcome};
 use revm::DatabaseRef;
 use revm_context::{BlockEnv, CfgEnv, TxEnv};
 use revm_database::states::bundle_state::BundleRetention;
@@ -52,7 +49,7 @@ where
     scheduler.execute().expect("block execution failed");
 
     let (results, mut state) = scheduler.take_result_and_state();
-    let bundle = state.parallel_take_bundle(BundleRetention::Reverts);
+    let bundle = state.take_bundle_with_retention(BundleRetention::Reverts);
 
     // The safe default rejects invalid fixed-block transactions. `Skipped` is only returned when
     // the caller explicitly selects Omit or IncludeNoop policy.
@@ -78,8 +75,7 @@ use std::sync::Arc;
 
 use grevm::{
     DynParallelPrecompile, ExecutionProfile, ExecutionResources, ExecutionSession, GrevmConfig,
-    GrevmConfigError, GrevmError, ParallelState, ParallelTakeBundle, Scheduler, SchedulerTuning,
-    TxExecutionOutcome,
+    GrevmConfigError, GrevmError, ParallelState, Scheduler, SchedulerTuning, TxExecutionOutcome,
 };
 use revm::DatabaseRef;
 use revm_context::{BlockEnv, CfgEnv, TxEnv};
@@ -143,6 +139,7 @@ impl<DB: DatabaseRef> ParallelState<DB> {
     pub fn new(database: DB, with_bundle_update: bool, update_db_metrics: bool) -> Self;
     pub const fn database(&self) -> &DB;
     pub fn into_database(self) -> DB;
+    pub fn take_bundle_with_retention(&mut self, retention: BundleRetention) -> BundleState;
 }
 
 impl GrevmConfig {
@@ -152,9 +149,6 @@ impl GrevmConfig {
     pub const fn gravity(tuning: SchedulerTuning) -> Self;
 }
 
-impl<DB: DatabaseRef> ParallelTakeBundle for ParallelState<DB> {
-    fn parallel_take_bundle(&mut self, retention: BundleRetention) -> BundleState;
-}
 ```
 
 Public items re-exported from the crate root include `Scheduler`, `ExecutionSession`,
@@ -164,8 +158,8 @@ Public items re-exported from the crate root include `Scheduler`, `ExecutionSess
 `InvalidTransaction`, `GrevmError`, `ParallelPrecompile`, `DynParallelPrecompile`,
 `ParallelPrecompileInput`, `ParallelPrecompileState`, `ParallelPrecompileResult`, and
 `ParallelPrecompileError`.
-`ParallelBundleState` is the lower-level extension for applying transitions directly to revm's
-`BundleState`; `ParallelTakeBundle` finalizes and extracts a block bundle.
+`ParallelState::take_bundle_with_retention` finalizes pending transitions through revm's canonical
+merge and extracts the block bundle without using an uncoordinated global worker pool.
 
 ## Block-scoped sessions and concurrent databases
 
@@ -314,12 +308,13 @@ permit while waiting for that callback, so a nested acquisition can deadlock. In
 cannot avoid synchronous nesting must use an independent dedicated budget for the inner work and
 account for the combined CPU limit themselves.
 
-The budget does not yet replace per-batch OS thread creation, and bundle preparation can also use
-the process-wide Rayon pool. Validate both costs with representative payload-build benchmarks and
-soak tests, including cancellation, sequential fallback, provider read-handle limits, memory
-high-water marks, simultaneous state-root work, and multiple batches per block. A reusable
-session-private scheduler runtime is a separate optimization because it changes borrowed-state,
-panic-propagation, and shutdown lifetimes.
+The budget does not yet replace per-batch OS thread creation. Bundle materialization stays on
+revm's canonical serial path so it cannot bypass the budget through a global worker pool. Validate
+both execution and finalization costs with representative payload-build benchmarks and soak tests,
+including cancellation, sequential fallback, provider read-handle limits, memory high-water marks,
+simultaneous state-root work, and multiple batches per block. A reusable session-private scheduler
+runtime is a separate optimization because it changes borrowed-state, panic-propagation, and
+shutdown lifetimes.
 
 ## Integration with reth
 

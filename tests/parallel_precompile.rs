@@ -4,7 +4,7 @@
 
 use grevm::{
     DelegatedSafetyConfig, DynParallelPrecompile, InvalidTransaction, InvalidTransactionPolicy,
-    ParallelState, ParallelTakeBundle, Scheduler, SchedulerTuning, TxExecutionOutcome,
+    ParallelState, Scheduler, SchedulerTuning, TxExecutionOutcome,
     test_utils::{
         common::{account, execute, storage::InMemoryDB},
         execution_resources_for_workers, runtime_config_with_policies,
@@ -233,7 +233,7 @@ fn execute_block(
         assert_eq!(metrics["grevm.parallel_worker_cnt"], 2);
     }
     let (outcomes, mut state) = scheduler.take_result_and_state();
-    let bundle = state.parallel_take_bundle(BundleRetention::Reverts);
+    let bundle = state.take_bundle_with_retention(BundleRetention::Reverts);
     (outcomes, bundle, metrics)
 }
 
@@ -765,7 +765,7 @@ fn fatal_precompile_discards_its_parallel_incarnation_writes() {
 
     let (outcomes, mut state) = scheduler.take_result_and_state();
     assert!(outcomes.is_empty(), "a fatal tx cannot enter the committed outcome prefix");
-    let bundle = state.parallel_take_bundle(BundleRetention::Reverts);
+    let bundle = state.take_bundle_with_retention(BundleRetention::Reverts);
     assert_eq!(
         final_storage(&db, &bundle, state_holder(), SLOT_0),
         U256::from(OLD_VALUE),

@@ -137,6 +137,24 @@ fn canonical_commit_accepts_state_from_an_uncached_evm() {
 }
 
 #[test]
+fn taking_bundle_finalizes_pending_transitions_with_revm_semantics() {
+    let address = Address::with_last_byte(0x24);
+    let changes = changed_account_state(address, 7, 9, 3, 4);
+    let mut parallel = ParallelState::for_block(EmptyDB::default());
+    let mut reference =
+        StateBuilder::new().with_database(EmptyDB::default()).with_bundle_update().build();
+
+    parallel.commit(changes.clone());
+    reference.commit(changes);
+    reference.merge_transitions(BundleRetention::Reverts);
+
+    assert_eq!(
+        parallel.take_bundle_with_retention(BundleRetention::Reverts),
+        reference.take_bundle()
+    );
+}
+
+#[test]
 fn canonical_cache_only_persists_changed_storage_slots() {
     for created in [false, true] {
         let address = Address::with_last_byte(0x40 + u8::from(created));

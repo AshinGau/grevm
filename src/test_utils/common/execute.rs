@@ -2,8 +2,8 @@ use alloy_evm::{EthEvm, Evm, precompiles::PrecompilesMap};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 
 use crate::{
-    DelegatedSafetyConfig, GrevmConfig, InvalidTransactionPolicy, ParallelState,
-    ParallelTakeBundle, Scheduler, SchedulerTuning, TxExecutionOutcome,
+    DelegatedSafetyConfig, GrevmConfig, InvalidTransactionPolicy, ParallelState, Scheduler,
+    SchedulerTuning, TxExecutionOutcome,
     test_utils::{execution_resources_for_workers, runtime_config_with_policies},
 };
 use revm::{
@@ -203,7 +203,7 @@ where
     .expect("valid differential-test scheduler configuration");
     scheduler.execute().expect("parallel execute failed");
     let (actual_outcomes, mut state) = scheduler.take_result_and_state();
-    let actual_bundle = state.parallel_take_bundle(BundleRetention::Reverts);
+    let actual_bundle = state.take_bundle_with_retention(BundleRetention::Reverts);
 
     assert_eq!(expected_outcomes, actual_outcomes, "transaction outcomes differ");
     compare_bundle_state(&expected_bundle, &actual_bundle);
@@ -274,7 +274,7 @@ where
     executor.execute().expect("parallel execute failed");
     let observed_metrics = (!parallel_metrics.is_empty()).then(|| executor.metrics_snapshot());
     let (results, mut state) = executor.take_result_and_state();
-    let parallel_result = (results, state.parallel_take_bundle(BundleRetention::Reverts));
+    let parallel_result = (results, state.take_bundle_with_retention(BundleRetention::Reverts));
     let grevm = start.elapsed();
 
     if let Some(snapshotter) = snapshotter {
