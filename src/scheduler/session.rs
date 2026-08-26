@@ -68,6 +68,11 @@ impl<DBError> BatchExecutionResult<DBError> {
 /// custom precompiles for the lifetime of one block. Each [`execute_batch`](Self::execute_batch)
 /// invocation creates a fresh one-shot scheduler and then restores its canonical state into the
 /// session, so cache, bundle transitions, EIP-7928 state, and state hooks continue across batches.
+///
+/// Profiles whose effective fork policy enables delegated-balance reservation are rejected
+/// because that policy requires visibility of every later transaction in the block. Gravity
+/// integrations using that policy must execute the complete ordered block with a one-shot
+/// [`Scheduler`].
 #[derive(Debug)]
 pub struct ExecutionSession<DB>
 where
@@ -93,7 +98,7 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if [`GrevmConfig::concurrency_level`] is zero.
+    /// Panics if the configuration is invalid for batched execution.
     pub fn new(
         cfg: CfgEnv,
         block: BlockEnv,
@@ -102,7 +107,7 @@ where
         config: GrevmConfig,
     ) -> Self {
         Self::try_new(cfg, block, state, custom_precompiles, config)
-            .expect("grevm concurrency level must be greater than zero")
+            .expect("invalid GREVM execution-session configuration")
     }
 
     /// Tries to create a block-scoped execution session.
@@ -112,7 +117,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`GrevmConfigError`] when `config` violates scheduler invariants.
+    /// Returns [`GrevmConfigError`] when `config` violates scheduler invariants or requires
+    /// complete-block lookahead.
     pub fn try_new(
         cfg: CfgEnv,
         block: BlockEnv,
@@ -139,7 +145,8 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`GrevmConfigError`] when `config` violates scheduler invariants.
+    /// Returns [`GrevmConfigError`] when `config` violates scheduler invariants or requires
+    /// complete-block lookahead.
     pub fn try_new_with_resources(
         cfg: CfgEnv,
         block: BlockEnv,
@@ -149,6 +156,9 @@ where
         resources: ExecutionResources,
     ) -> Result<Self, GrevmConfigError> {
         config.validate()?;
+        if config.delegated_safety().for_spec(cfg.spec).reserve_delegated_balance {
+            return Err(GrevmConfigError::DelegatedBalanceReserveRequiresFullBlock)
+        }
         Ok(Self { cfg, block, state: Some(state), custom_precompiles, config, resources })
     }
 
@@ -267,7 +277,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DelegatedSafetyConfig, InvalidTransactionPolicy};
+    use crate::{DelegatedSafetyConfig, InvalidTransactionPolicy, SchedulerTuning};
     use revm::DatabaseRef;
     use revm_context::result::InvalidTransaction;
     use revm_database::EmptyDB;
@@ -351,6 +361,32 @@ mod tests {
         );
 
         assert!(matches!(result, Err(GrevmConfigError::ZeroConcurrency)));
+    }
+
+    #[test]
+    fn session_rejects_delegated_balance_reservation_without_full_block_visibility() {
+        let result = ExecutionSession::try_new(
+            CfgEnv::new_with_spec(SpecId::PRAGUE),
+            BlockEnv::default(),
+            ParallelState::for_block(EmptyDB::default()),
+            None,
+            GrevmConfig::gravity(SchedulerTuning::default()),
+        );
+
+        assert!(matches!(result, Err(GrevmConfigError::DelegatedBalanceReserveRequiresFullBlock)));
+    }
+
+    #[test]
+    fn session_accepts_inactive_delegated_balance_reservation() {
+        let result = ExecutionSession::try_new(
+            CfgEnv::new_with_spec(SpecId::CANCUN),
+            BlockEnv::default(),
+            ParallelState::for_block(EmptyDB::default()),
+            None,
+            GrevmConfig::gravity(SchedulerTuning::default()),
+        );
+
+        assert!(result.is_ok());
     }
 
     #[test]

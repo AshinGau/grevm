@@ -2,7 +2,7 @@ mod cache;
 #[cfg(test)]
 mod tests;
 
-use cache::CacheAccountInfo;
+use cache::{CacheAccountInfo, ParallelCacheState};
 use core::hash::{BuildHasherDefault, Hasher};
 use dashmap::{DashMap, Entry};
 use metrics::histogram;
@@ -22,8 +22,6 @@ use std::{
     time::{Duration, Instant},
     vec::Vec,
 };
-
-pub use cache::ParallelCacheState;
 
 /// State of blockchain.
 ///
@@ -329,15 +327,6 @@ impl<DB> std::fmt::Debug for ParallelState<DB> {
 }
 
 impl<DB> ParallelState<DB> {
-    /// Returns a read-only view of the canonical cache.
-    ///
-    /// Preload state through the typed methods on [`ParallelState`]. Canonical EVM output must be
-    /// applied through [`DatabaseCommit::commit`] so transition tracking, the state hook, and BAL
-    /// construction remain synchronized.
-    pub const fn cache(&self) -> &ParallelCacheState {
-        &self.cache
-    }
-
     /// Returns the backing database.
     pub const fn database(&self) -> &DB {
         &self.database

@@ -1,8 +1,5 @@
 use dashmap::{DashMap, Entry, mapref::one::RefMut};
-use revm_database::{
-    AccountStatus, CacheState, PlainAccount, TransitionAccount,
-    states::{CacheAccount, plain_account::PlainStorage},
-};
+use revm_database::{AccountStatus, TransitionAccount, states::plain_account::PlainStorage};
 use revm_primitives::{Address, B256, U256};
 use revm_state::{Account, AccountInfo, Bytecode, EvmStorage};
 use std::borrow::Cow;
@@ -11,7 +8,7 @@ pub(super) type RevmTransition<'a> = TransitionAccount<Option<Cow<'a, EvmStorage
 
 /// Cache state shared by speculative EVM workers and the ordered commit path.
 #[derive(Clone, Debug, Default)]
-pub struct ParallelCacheState {
+pub(super) struct ParallelCacheState {
     /// Cached accounts.
     pub(super) accounts: DashMap<Address, CacheAccountInfo>,
     /// Cached storage slots.
@@ -127,48 +124,11 @@ impl CacheAccountInfo {
 }
 
 impl ParallelCacheState {
-    /// Create an empty cache.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Copy the cached data into a revm [`CacheState`].
-    pub fn as_cache_state(&self) -> CacheState {
-        let mut state = CacheState::new();
-        for entry in self.accounts.iter() {
-            let info = entry.value();
-            state.accounts.insert(
-                *entry.key(),
-                CacheAccount {
-                    account: info
-                        .account
-                        .clone()
-                        .map(|info| PlainAccount { info, storage: PlainStorage::default() }),
-                    status: info.status,
-                },
-            );
-        }
-        for entry in self.contracts.iter() {
-            state.contracts.insert(*entry.key(), entry.value().clone());
-        }
-        for entry in self.storage.iter() {
-            let address = *entry.key();
-            if let Some(account) = state.accounts.get_mut(&address) &&
-                let Some(account) = account.account.as_mut()
-            {
-                for slot in entry.value().iter() {
-                    account.storage.insert(*slot.key(), *slot.value());
-                }
-            }
-        }
-        state
-    }
-
     /// Insert a non-existent account.
     ///
     /// This replaces any cached account and storage for `address`. Call it only while no execution
     /// worker is reading the cache.
-    pub fn insert_not_existing(&mut self, address: Address) {
+    pub(super) fn insert_not_existing(&mut self, address: Address) {
         self.storage.remove(&address);
         self.accounts
             .insert(address, CacheAccountInfo::new(None, AccountStatus::LoadedNotExisting));
@@ -178,7 +138,7 @@ impl ParallelCacheState {
     ///
     /// This replaces any cached account and storage for `address`. Call it only while no execution
     /// worker is reading the cache.
-    pub fn insert_account(&mut self, address: Address, info: AccountInfo) {
+    pub(super) fn insert_account(&mut self, address: Address, info: AccountInfo) {
         self.storage.remove(&address);
         self.insert_account_info(address, info);
     }
@@ -196,7 +156,7 @@ impl ParallelCacheState {
     ///
     /// This replaces any cached account and storage for `address`. Call it only while no execution
     /// worker is reading the cache.
-    pub fn insert_account_with_storage(
+    pub(super) fn insert_account_with_storage(
         &mut self,
         address: Address,
         info: AccountInfo,

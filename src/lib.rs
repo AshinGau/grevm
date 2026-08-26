@@ -47,7 +47,7 @@ pub use config::{
 pub use delegated_safety::DelegatedSafetyConfig;
 pub use execution_resources::ExecutionResources;
 pub use outcome::{GrevmError, TxExecutionOutcome};
-pub use parallel_state::{ParallelCacheState, ParallelState};
+pub use parallel_state::ParallelState;
 pub use precompile::{
     DynParallelPrecompile, ParallelPrecompile, ParallelPrecompileError, ParallelPrecompileInput,
     ParallelPrecompileResult, ParallelPrecompileState,

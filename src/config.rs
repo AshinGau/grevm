@@ -248,6 +248,12 @@ impl GrevmConfig {
 pub enum GrevmConfigError {
     /// At least one execution worker is required.
     ZeroConcurrency,
+    /// Delegated-balance reservation requires visibility of the complete ordered block.
+    ///
+    /// A reusable [`crate::ExecutionSession`] receives one batch at a time and therefore cannot
+    /// account for transactions in later batches. Use a one-shot [`crate::Scheduler`] containing
+    /// the full block when this policy is active for the selected EVM spec.
+    DelegatedBalanceReserveRequiresFullBlock,
 }
 
 impl fmt::Display for GrevmConfigError {
@@ -256,6 +262,9 @@ impl fmt::Display for GrevmConfigError {
             Self::ZeroConcurrency => {
                 f.write_str("GREVM concurrency level must be greater than zero")
             }
+            Self::DelegatedBalanceReserveRequiresFullBlock => f.write_str(
+                "delegated balance reservation requires one-shot execution of the complete block",
+            ),
         }
     }
 }

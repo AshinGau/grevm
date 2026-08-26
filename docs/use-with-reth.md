@@ -154,7 +154,7 @@ impl GrevmConfig {
 Public items re-exported from the crate root include `Scheduler`, `ExecutionSession`,
 `BatchExecutionResult`, `ExecutionResources`, `ConcurrentDatabase`, `DatabaseFactory`, `ReadCache`,
 `GrevmConfig`, `GrevmConfigError`, `SchedulerTuning`, `ExecutionProfile`, `InvalidTransactionPolicy`,
-`DelegatedSafetyConfig`, `ParallelState`, `ParallelCacheState`, `TxExecutionOutcome`,
+`DelegatedSafetyConfig`, `ParallelState`, `TxExecutionOutcome`,
 `InvalidTransaction`, `GrevmError`, `ParallelPrecompile`, `DynParallelPrecompile`,
 `ParallelPrecompileInput`, `ParallelPrecompileState`, `ParallelPrecompileResult`, and
 `ParallelPrecompileError`.
@@ -200,6 +200,13 @@ let state = session.into_state();
 The cancellation predicate is borrowed only for the synchronous call. It is invoked concurrently
 and repeatedly, so it must be cheap, non-blocking, and thread-safe. Cancellation is cooperative at
 scheduler boundaries; it does not preempt an EVM invocation already in progress.
+
+`ExecutionSession` rejects configurations whose effective fork policy has
+`reserve_delegated_balance = true`. That policy must see all later block transactions when
+computing a delegated account's reserve, while a session receives only one batch at a time.
+Gravity must use a one-shot `Scheduler` containing the complete ordered block once Prague is
+active; Ethereum builder, validator, and history-sync profiles keep the policy disabled and can
+safely use sessions.
 
 `ConcurrentDatabase` provides one lazily created `DatabaseRef` handle per worker thread and a
 shared key-level single-flight `ReadCache`. This is the storage boundary for integrations whose
@@ -284,6 +291,10 @@ use grevm::{GrevmConfig, SchedulerTuning};
 
 let config = GrevmConfig::gravity(SchedulerTuning::default());
 ```
+
+Because balance reservation depends on transactions later in the same block, pass this profile to
+a one-shot `Scheduler` together with the complete ordered transaction vector. `ExecutionSession`
+rejects it instead of silently weakening the reserve across batch boundaries.
 
 Normal integrations select these two guards together through the named Gravity profile; Ethereum
 builder, validator, and history-sync integrations must use the corresponding Ethereum profile.
