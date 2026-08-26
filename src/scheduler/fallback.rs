@@ -59,7 +59,10 @@ where
     /// or fatal EVM error. Invalid transaction behavior follows
     /// [`crate::GrevmConfig::invalid_transaction_policy`].
     pub fn fallback_sequential(&self) -> Result<(), GrevmError<DB::Error>> {
-        self.run_once(|_| self.replay_uncommitted_suffix(CommittedPrefixEnd::ZERO, None))
+        self.run_once(|_| {
+            let _allocation = self.acquire_execution_resources(None, None)?;
+            self.replay_uncommitted_suffix(CommittedPrefixEnd::ZERO, None)
+        })
     }
 
     pub(super) fn replay_uncommitted_suffix(

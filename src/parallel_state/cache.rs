@@ -1,12 +1,10 @@
 use dashmap::{DashMap, Entry, mapref::one::RefMut};
 use revm_database::{
-    AccountStatus, CacheState, PlainAccount, StorageWithOriginalValues, TransitionAccount,
-    states::{CacheAccount, StorageSlot, plain_account::PlainStorage},
+    AccountStatus, CacheState, PlainAccount, TransitionAccount,
+    states::{CacheAccount, plain_account::PlainStorage},
 };
 use revm_primitives::{Address, B256, U256};
-use revm_state::{
-    Account, AccountInfo, Bytecode, EvmState, EvmStorage, EvmStorageSlot, TransactionId,
-};
+use revm_state::{Account, AccountInfo, Bytecode, EvmStorage};
 use std::borrow::Cow;
 
 pub(super) type RevmTransition<'a> = TransitionAccount<Option<Cow<'a, EvmStorage>>>;
@@ -170,7 +168,7 @@ impl ParallelCacheState {
     ///
     /// This replaces any cached account and storage for `address`. Call it only while no execution
     /// worker is reading the cache.
-    pub fn insert_not_existing(&self, address: Address) {
+    pub fn insert_not_existing(&mut self, address: Address) {
         self.storage.remove(&address);
         self.accounts
             .insert(address, CacheAccountInfo::new(None, AccountStatus::LoadedNotExisting));
@@ -180,7 +178,7 @@ impl ParallelCacheState {
     ///
     /// This replaces any cached account and storage for `address`. Call it only while no execution
     /// worker is reading the cache.
-    pub fn insert_account(&self, address: Address, info: AccountInfo) {
+    pub fn insert_account(&mut self, address: Address, info: AccountInfo) {
         self.storage.remove(&address);
         self.insert_account_info(address, info);
     }
@@ -199,7 +197,7 @@ impl ParallelCacheState {
     /// This replaces any cached account and storage for `address`. Call it only while no execution
     /// worker is reading the cache.
     pub fn insert_account_with_storage(
-        &self,
+        &mut self,
         address: Address,
         info: AccountInfo,
         storage: PlainStorage,
@@ -210,19 +208,6 @@ impl ParallelCacheState {
         }
         self.storage.insert(address, slots);
         self.insert_account_info(address, info);
-    }
-
-    /// Apply EVM output and return owned transitions.
-    ///
-    /// This compatibility API preserves the pre-REVM-42 GREVM interface. Canonical execution uses
-    /// an internal streaming path to avoid allocating an intermediate vector.
-    pub fn apply_evm_state(&mut self, evm_state: EvmState) -> Vec<(Address, TransitionAccount)> {
-        let mut transitions = Vec::with_capacity(evm_state.len());
-        self.apply_evm_state_with(
-            evm_state.into_iter().map(|(address, account)| (address, Cow::Owned(account))),
-            |address, transition| transitions.push((address, into_owned_transition(transition))),
-        );
-        transitions
     }
 
     pub(super) fn apply_evm_state_with<'a>(
@@ -333,41 +318,4 @@ impl ParallelCacheState {
             }
         }
     }
-}
-
-pub(super) fn into_revm_transition(transition: TransitionAccount) -> RevmTransition<'static> {
-    transition.map_storage(|storage| {
-        Some(Cow::Owned(
-            storage
-                .into_iter()
-                .map(|(key, slot)| {
-                    (
-                        key,
-                        EvmStorageSlot::new_changed(
-                            slot.original_value(),
-                            slot.present_value(),
-                            TransactionId::ZERO,
-                        ),
-                    )
-                })
-                .collect(),
-        ))
-    })
-}
-
-fn into_owned_transition(transition: RevmTransition<'_>) -> TransitionAccount {
-    transition.map_storage(|storage| {
-        let mut changed = StorageWithOriginalValues::default();
-        if let Some(storage) = storage {
-            for (key, slot) in storage.iter() {
-                if slot.is_changed() {
-                    changed.insert(
-                        *key,
-                        StorageSlot::new_changed(slot.original_value, slot.present_value),
-                    );
-                }
-            }
-        }
-        changed
-    })
 }

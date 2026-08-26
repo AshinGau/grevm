@@ -3,11 +3,12 @@
 //! End-to-end tests for grevm's opt-in EIP-7702 delegated-account safety policy.
 
 use grevm::{
-    DelegatedSafetyConfig, DynParallelPrecompile, GrevmConfig, InvalidTransaction,
-    InvalidTransactionPolicy, ParallelState, ParallelTakeBundle, Scheduler, TxExecutionOutcome,
+    DelegatedSafetyConfig, DynParallelPrecompile, InvalidTransaction, InvalidTransactionPolicy,
+    ParallelState, ParallelTakeBundle, Scheduler, SchedulerTuning, TxExecutionOutcome,
     test_utils::{
         TRANSFER_GAS_LIMIT,
         common::{account, execute, storage::InMemoryDB},
+        execution_resources_for_workers, runtime_config_with_policies,
     },
 };
 use revm::precompile::{PrecompileId, PrecompileOutput};
@@ -287,21 +288,22 @@ fn execute_block_with_precompiles_and_spec(
     let txs = Arc::new(txs);
     let block = BlockEnv { beneficiary: account::MINER_ADDRESS, ..Default::default() };
     let state = ParallelState::new(Arc::new(db), true, true);
-    let config = GrevmConfig {
-        concurrency_level,
-        force_sequential,
-        min_parallel_txs: 0,
-        invalid_transaction_policy: InvalidTransactionPolicy::IncludeNoop,
-        delegated_safety: safety,
-    };
-    let scheduler = Scheduler::new_with_runtime_config(
+    let config = runtime_config_with_policies(
+        SchedulerTuning { concurrency_level, force_sequential, min_parallel_txs: 0 },
+        InvalidTransactionPolicy::IncludeNoop,
+        safety,
+    );
+    let resources = execution_resources_for_workers(concurrency_level);
+    let scheduler = Scheduler::try_new_with_runtime_config_and_resources(
         CfgEnv::new_with_spec(spec),
         block,
         txs,
         state,
         custom_precompiles,
         config,
-    );
+        resources,
+    )
+    .expect("valid delegated-safety test scheduler configuration");
     scheduler.execute().expect("block execution failed");
     let (outcomes, mut state) = scheduler.take_result_and_state();
     let bundle = state.parallel_take_bundle(BundleRetention::Reverts);

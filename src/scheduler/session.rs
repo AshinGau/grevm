@@ -1,7 +1,10 @@
 //! Reusable block execution session for ordered transaction batches.
 
 use super::{Scheduler, control::SchedulerExecutionError};
-use crate::{DynParallelPrecompile, GrevmConfig, GrevmError, ParallelState, TxExecutionOutcome};
+use crate::{
+    DynParallelPrecompile, ExecutionResources, GrevmConfig, GrevmConfigError, GrevmError,
+    ParallelState, TxExecutionOutcome,
+};
 use revm::DatabaseRef;
 use revm_context::{BlockEnv, CfgEnv, TxEnv, result::EVMError};
 use revm_primitives::Address;
@@ -75,6 +78,7 @@ where
     state: Option<ParallelState<DB>>,
     custom_precompiles: Option<Arc<Vec<(Address, DynParallelPrecompile)>>>,
     config: GrevmConfig,
+    resources: ExecutionResources,
 }
 
 impl<DB> ExecutionSession<DB>
@@ -97,8 +101,55 @@ where
         custom_precompiles: Option<Arc<Vec<(Address, DynParallelPrecompile)>>>,
         config: GrevmConfig,
     ) -> Self {
-        assert!(config.concurrency_level > 0, "grevm concurrency level must be greater than zero");
-        Self { cfg, block, state: Some(state), custom_precompiles, config }
+        Self::try_new(cfg, block, state, custom_precompiles, config)
+            .expect("grevm concurrency level must be greater than zero")
+    }
+
+    /// Tries to create a block-scoped execution session.
+    ///
+    /// `custom_precompiles` is subject to the retry-safety contract documented on
+    /// [`Scheduler::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GrevmConfigError`] when `config` violates scheduler invariants.
+    pub fn try_new(
+        cfg: CfgEnv,
+        block: BlockEnv,
+        state: ParallelState<DB>,
+        custom_precompiles: Option<Arc<Vec<(Address, DynParallelPrecompile)>>>,
+        config: GrevmConfig,
+    ) -> Result<Self, GrevmConfigError> {
+        Self::try_new_with_resources(
+            cfg,
+            block,
+            state,
+            custom_precompiles,
+            config,
+            ExecutionResources::process_default(),
+        )
+    }
+
+    /// Tries to create a block-scoped session with an explicit execution resource budget.
+    ///
+    /// The same budget is reused by every batch in this session. Normal integrations should call
+    /// [`Self::try_new`] so all GREVM workloads share the process-wide default.
+    /// `custom_precompiles` is subject to the retry-safety contract documented on
+    /// [`Scheduler::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GrevmConfigError`] when `config` violates scheduler invariants.
+    pub fn try_new_with_resources(
+        cfg: CfgEnv,
+        block: BlockEnv,
+        state: ParallelState<DB>,
+        custom_precompiles: Option<Arc<Vec<(Address, DynParallelPrecompile)>>>,
+        config: GrevmConfig,
+        resources: ExecutionResources,
+    ) -> Result<Self, GrevmConfigError> {
+        config.validate()?;
+        Ok(Self { cfg, block, state: Some(state), custom_precompiles, config, resources })
     }
 
     /// Returns the canonical state accumulated by every completed batch.
@@ -170,14 +221,16 @@ where
             .state
             .take()
             .expect("execution session does not allow overlapping batch executions");
-        let scheduler = Scheduler::new_with_runtime_config(
+        let scheduler = Scheduler::try_new_with_runtime_config_and_resources(
             self.cfg.clone(),
             self.block.clone(),
             Arc::new(transactions),
             state,
             self.custom_precompiles.clone(),
             self.config.clone(),
-        );
+            self.resources.clone(),
+        )
+        .expect("execution session validates its GREVM configuration at construction");
         let status = match cancellation {
             Some(cancellation) => scheduler.execute_with_typed_cancellation(cancellation),
             None => scheduler.execute().map_err(SchedulerExecutionError::Failed),
@@ -220,9 +273,12 @@ mod tests {
     use revm_database::EmptyDB;
     use revm_primitives::{TxKind, U256, hardfork::SpecId};
     use revm_state::AccountInfo;
-    use std::sync::{
-        Mutex,
-        atomic::{AtomicBool, Ordering},
+    use std::{
+        num::NonZeroUsize,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
     };
 
     const GAS_LIMIT: u64 = 21_000;
@@ -260,22 +316,41 @@ mod tests {
 
     fn session_with_config(config: GrevmConfig) -> ExecutionSession<EmptyDB> {
         let caller = Address::with_last_byte(1);
-        let state = ParallelState::new(EmptyDB::default(), true, false).with_bal_builder();
+        let mut state = ParallelState::new(EmptyDB::default(), true, false).with_bal_builder();
         state.insert_account(
             caller,
             AccountInfo { balance: U256::from(1_000_000), ..Default::default() },
         );
-        ExecutionSession::new(
+        let resources = ExecutionResources::dedicated(
+            NonZeroUsize::new(config.concurrency_level.saturating_add(2)).unwrap(),
+        );
+        ExecutionSession::try_new_with_resources(
             CfgEnv::new_with_spec(SpecId::SHANGHAI),
             BlockEnv::default(),
             state,
             None,
             config,
+            resources,
         )
+        .unwrap()
     }
 
     fn session(policy: InvalidTransactionPolicy) -> ExecutionSession<EmptyDB> {
         session_with_config(sequential_config(policy))
+    }
+
+    #[test]
+    fn try_constructor_rejects_zero_concurrency() {
+        let config = GrevmConfig { concurrency_level: 0, ..GrevmConfig::default() };
+        let result = ExecutionSession::try_new(
+            CfgEnv::new_with_spec(SpecId::SHANGHAI),
+            BlockEnv::default(),
+            ParallelState::for_block(EmptyDB::default()),
+            None,
+            config,
+        );
+
+        assert!(matches!(result, Err(GrevmConfigError::ZeroConcurrency)));
     }
 
     #[test]

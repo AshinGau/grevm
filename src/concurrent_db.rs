@@ -4,6 +4,10 @@
 //! own: each worker needs an independent database handle, while identical cold reads should be
 //! coalesced across workers. [`ConcurrentDatabase`] combines a [`DatabaseFactory`] with a shared
 //! [`ReadCache`] to provide both properties without coupling Grevm to a particular storage engine.
+//!
+//! Every handle created by one factory, and every value used to seed its cache, must represent the
+//! same immutable state snapshot. A cache is snapshot-scoped and must not be reused for another
+//! block or parent state.
 
 use dashmap::{DashMap, mapref::entry::Entry};
 use parking_lot::Mutex;
@@ -41,7 +45,8 @@ where
 
     /// Creates a concurrent database backed by `cache`.
     ///
-    /// This is useful for seeding reads retained by a previous execution attempt.
+    /// This is useful for seeding reads retained by a previous execution attempt against the same
+    /// immutable state snapshot.
     pub fn with_cache(factory: F, cache: ReadCache<F::Error>) -> Self {
         Self {
             inner: Arc::new(ConcurrentDatabaseInner { factory, databases: DashMap::new(), cache }),
@@ -142,13 +147,14 @@ where
     fn storage_by_account_id_ref(
         &self,
         address: Address,
-        account_id: AccountId,
+        _account_id: AccountId,
         index: U256,
     ) -> Result<U256, Self::Error> {
+        // AccountId is only an optimization hint and can be scoped to the database handle that
+        // produced it. `basic_ref` results are shared across worker handles, so forwarding the
+        // hint to a different handle would be unsound for handle-local implementations.
         self.inner.cache.load_storage(address, index, || {
-            self.with_database(|database| {
-                database.storage_by_account_id_ref(address, account_id, index)
-            })
+            self.with_database(|database| database.storage_ref(address, index))
         })
     }
 
@@ -160,6 +166,10 @@ where
 }
 
 /// Creates independent database handles for parallel execution workers.
+///
+/// Every handle produced by one factory must read the same immutable state snapshot. Implementors
+/// must not advance a handle to another block while a [`ConcurrentDatabase`] or its [`ReadCache`]
+/// remains in use.
 ///
 /// A created database only needs to be [`Send`], not [`Sync`]: [`ConcurrentDatabase`] serializes
 /// access to each handle and assigns handles by calling thread. Factory and database errors use the
@@ -190,12 +200,16 @@ where
 
 /// Shared, key-level single-flight cache for parent-state database reads.
 ///
+/// A cache belongs to exactly one immutable database snapshot. Reusing it for another block or
+/// parent state can combine values from different states and is incorrect.
+///
 /// Both successful reads and errors are cached. This gives every worker a coherent result for a
 /// key during one execution attempt and prevents a failing storage backend from being hammered by
 /// all workers. Export iterators yield only successful reads; integrations can retain them across
-/// execution attempts without persisting transient errors. DashMap iteration is weakly consistent,
-/// so integrations should export reads only after all execution workers using this cache have
-/// joined.
+/// execution attempts against the same snapshot without exporting transient errors. A retry after
+/// a transient backend error must use a fresh cache because errors remain cached. DashMap iteration
+/// is weakly consistent, so integrations should export reads only after all execution workers
+/// using this cache have joined.
 pub struct ReadCache<E> {
     inner: Arc<ReadCacheInner<E>>,
 }
@@ -410,8 +424,40 @@ mod tests {
 
     struct TestDatabase {
         reads: Arc<AtomicUsize>,
+        account_id_reads: Arc<AtomicUsize>,
         drops: Arc<AtomicUsize>,
         fail: bool,
+    }
+
+    struct TestDatabaseFactory {
+        creates: Arc<AtomicUsize>,
+        reads: Arc<AtomicUsize>,
+        account_id_reads: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    impl DatabaseFactory for TestDatabaseFactory {
+        type Database = TestDatabase;
+        type Error = TestError;
+
+        fn create(&self) -> Result<Self::Database, Self::Error> {
+            self.creates.fetch_add(1, Ordering::Relaxed);
+            Ok(TestDatabase {
+                reads: self.reads.clone(),
+                account_id_reads: self.account_id_reads.clone(),
+                drops: self.drops.clone(),
+                fail: self.fail,
+            })
+        }
+    }
+
+    struct TestDatabaseHarness {
+        database: ConcurrentDatabase<TestDatabaseFactory>,
+        creates: Arc<AtomicUsize>,
+        reads: Arc<AtomicUsize>,
+        account_id_reads: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
     }
 
     impl Drop for TestDatabase {
@@ -442,6 +488,16 @@ mod tests {
             Ok(index)
         }
 
+        fn storage_by_account_id_ref(
+            &self,
+            _address: Address,
+            _account_id: AccountId,
+            _index: U256,
+        ) -> Result<U256, Self::Error> {
+            self.account_id_reads.fetch_add(1, Ordering::Relaxed);
+            Err(TestError)
+        }
+
         fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
             self.reads.fetch_add(1, Ordering::Relaxed);
             let mut block_hash = [0; 32];
@@ -450,34 +506,24 @@ mod tests {
         }
     }
 
-    fn test_database(
-        fail: bool,
-    ) -> (
-        ConcurrentDatabase<impl DatabaseFactory<Database = TestDatabase, Error = TestError>>,
-        Arc<AtomicUsize>,
-        Arc<AtomicUsize>,
-        Arc<AtomicUsize>,
-    ) {
+    fn test_database(fail: bool) -> TestDatabaseHarness {
         let creates = Arc::new(AtomicUsize::new(0));
         let reads = Arc::new(AtomicUsize::new(0));
+        let account_id_reads = Arc::new(AtomicUsize::new(0));
         let drops = Arc::new(AtomicUsize::new(0));
-        let factory_creates = creates.clone();
-        let factory_reads = reads.clone();
-        let factory_drops = drops.clone();
-        let database = ConcurrentDatabase::new(move || {
-            factory_creates.fetch_add(1, Ordering::Relaxed);
-            Ok::<_, TestError>(TestDatabase {
-                reads: factory_reads.clone(),
-                drops: factory_drops.clone(),
-                fail,
-            })
+        let database = ConcurrentDatabase::new(TestDatabaseFactory {
+            creates: creates.clone(),
+            reads: reads.clone(),
+            account_id_reads: account_id_reads.clone(),
+            drops: drops.clone(),
+            fail,
         });
-        (database, creates, reads, drops)
+        TestDatabaseHarness { database, creates, reads, account_id_reads, drops }
     }
 
     #[test]
     fn concurrent_reads_of_one_key_are_single_flight() {
-        let (database, creates, reads, _) = test_database(false);
+        let TestDatabaseHarness { database, creates, reads, .. } = test_database(false);
         let barrier = Arc::new(Barrier::new(TEST_THREADS));
         let address = Address::from([0x11; 20]);
 
@@ -498,7 +544,7 @@ mod tests {
 
     #[test]
     fn errors_are_single_flight_and_not_exported() {
-        let (database, creates, reads, _) = test_database(true);
+        let TestDatabaseHarness { database, creates, reads, .. } = test_database(true);
         let address = Address::from([0x22; 20]);
 
         for _ in 0..TEST_THREADS {
@@ -512,7 +558,7 @@ mod tests {
 
     #[test]
     fn clearing_thread_databases_releases_worker_handles() {
-        let (database, creates, _, drops) = test_database(false);
+        let TestDatabaseHarness { database, creates, drops, .. } = test_database(false);
         let barrier = Arc::new(Barrier::new(TEST_THREADS));
 
         thread::scope(|scope| {
@@ -537,7 +583,7 @@ mod tests {
 
     #[test]
     fn seeded_reads_are_exported_without_opening_a_database() {
-        let (database, creates, reads, _) = test_database(false);
+        let TestDatabaseHarness { database, creates, reads, .. } = test_database(false);
         let address = Address::from([0x33; 20]);
         let code_hash = B256::from([0x44; 32]);
         let block_hash = B256::from([0x55; 32]);
@@ -565,5 +611,17 @@ mod tests {
         );
         assert_eq!(database.cache().block_hash_reads().collect::<Vec<_>>(), vec![(3, block_hash)]);
         assert_eq!(database.cache().code_reads().count(), 1);
+    }
+
+    #[test]
+    fn account_id_hints_are_not_forwarded_across_database_handles() {
+        let TestDatabaseHarness { database, reads, account_id_reads, .. } = test_database(false);
+        let address = Address::from([0x66; 20]);
+        let index = U256::from(7);
+        let account_id = AccountId::new(1).unwrap();
+
+        assert_eq!(database.storage_by_account_id_ref(address, account_id, index), Ok(index));
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert_eq!(account_id_reads.load(Ordering::Relaxed), 0);
     }
 }

@@ -3,7 +3,8 @@ use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 
 use crate::{
     DelegatedSafetyConfig, GrevmConfig, InvalidTransactionPolicy, ParallelState,
-    ParallelTakeBundle, Scheduler, TxExecutionOutcome,
+    ParallelTakeBundle, Scheduler, SchedulerTuning, TxExecutionOutcome,
+    test_utils::{execution_resources_for_workers, runtime_config_with_policies},
 };
 use revm::{
     Context, DatabaseCommit, DatabaseRef, MainBuilder, MainContext, handler::EthPrecompiles,
@@ -64,9 +65,13 @@ fn assert_expected_metrics(
 /// stay disabled even if their defaults change later. Other scheduler settings still come from
 /// the environment for compatibility with the existing test and benchmark controls.
 pub fn revm_compatibility_config() -> GrevmConfig {
-    GrevmConfig::from_env()
-        .with_delegated_safety(DelegatedSafetyConfig::disabled())
-        .with_invalid_transaction_policy(InvalidTransactionPolicy::IncludeNoop)
+    let mut tuning = SchedulerTuning::from_env();
+    tuning.concurrency_level = tuning.concurrency_level.max(2);
+    runtime_config_with_policies(
+        tuning,
+        InvalidTransactionPolicy::IncludeNoop,
+        DelegatedSafetyConfig::disabled(),
+    )
 }
 
 pub fn compare_bundle_state(left: &BundleState, right: &BundleState) {
@@ -185,7 +190,17 @@ where
     let mut runtime_config = revm_compatibility_config();
     // Do not select the sequential path merely because an invalid fixture is small.
     runtime_config.min_parallel_txs = 0;
-    let scheduler = Scheduler::new_with_runtime_config(cfg, env, txs, state, None, runtime_config);
+    let resources = execution_resources_for_workers(runtime_config.concurrency_level);
+    let scheduler = Scheduler::try_new_with_runtime_config_and_resources(
+        cfg,
+        env,
+        txs,
+        state,
+        None,
+        runtime_config,
+        resources,
+    )
+    .expect("valid differential-test scheduler configuration");
     scheduler.execute().expect("parallel execute failed");
     let (actual_outcomes, mut state) = scheduler.take_result_and_state();
     let actual_bundle = state.parallel_take_bundle(BundleRetention::Reverts);
@@ -243,14 +258,18 @@ where
         std::env::var_os("GREVM_PRINT_METRICS").is_some().then(metrics_snapshotter).flatten();
     let start = Instant::now();
     let state = ParallelState::new(db.clone(), true, true);
-    let executor = Scheduler::new_with_runtime_config(
+    let runtime_config = revm_compatibility_config();
+    let resources = execution_resources_for_workers(runtime_config.concurrency_level);
+    let executor = Scheduler::try_new_with_runtime_config_and_resources(
         cfg.clone(),
         env.clone(),
         txs.clone(),
         state,
         None,
-        revm_compatibility_config(),
-    );
+        runtime_config,
+        resources,
+    )
+    .expect("valid differential-test scheduler configuration");
     // Keep production worker and fallback configuration effective during replay.
     executor.execute().expect("parallel execute failed");
     let observed_metrics = (!parallel_metrics.is_empty()).then(|| executor.metrics_snapshot());

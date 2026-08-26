@@ -52,9 +52,9 @@ benchmarks require `--features test-utils`.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `GREVM_MIN_PARALLEL_TXS` | `64` | Blocks with fewer transactions fall back to sequential. Set to `0` to force the parallel path even for tiny blocks (needed when replaying small real blocks). |
+| `GREVM_MIN_PARALLEL_TXS` | `64` | Blocks with fewer transactions fall back to sequential. Set to `0` to make tiny blocks eligible for parallel execution; the shared execution-role budget can still select sequential execution. |
 | `GREVM_FALLBACK_SEQUENTIAL` | `false` | Force sequential execution for every block. |
-| `GREVM_CONCURRENT_LEVEL` | logical CPUs reported by `available_parallelism` (or `8` if unavailable) | Number of speculative execution workers. |
+| `GREVM_CONCURRENT_LEVEL` | logical CPUs reported by `available_parallelism` (or `8` if unavailable) | Upper bound on speculative workers. The process budget also reserves two coordinator roles and caps overlapping schedulers. |
 | `GREVM_MAINNET_BLOCKS` | `test_data/mainnet_blocks` | Directory the mainnet replay test reads single-block fixtures from. |
 | `GREVM_MAINNET_BLOCK` | unset | If set, replay only this fixture number. |
 | `GREVM_CONTINUOUS_BLOCKS` | `test_data/con_eth_blocks` | Directory the `continuous` bench reads merged "big block" fixtures from. |
@@ -111,9 +111,10 @@ GREVM_MIN_PARALLEL_TXS=0 GREVM_MAINNET_BLOCK=25323281 \
   cargo test --features test-utils --test mainnet replay_mainnet_blocks
 ```
 
-`GREVM_MIN_PARALLEL_TXS=0` forces the parallel path even though real blocks are frequently smaller
-than 64 transactions. Without `GREVM_MAINNET_BLOCK` the test loads every fixture under
-`GREVM_MAINNET_BLOCKS` and asserts parallel == sequential for each.
+`GREVM_MIN_PARALLEL_TXS=0` makes real blocks smaller than 64 transactions eligible for the parallel
+path. The differential-test harness supplies an isolated role budget large enough for the selected
+workers, so this still exercises Block-STM on low-core CI runners. Without `GREVM_MAINNET_BLOCK` the
+test loads every fixture under `GREVM_MAINNET_BLOCKS` and asserts parallel == sequential for each.
 
 ### 3. Pipelined discover-and-replay (`replay_mainnet`)
 

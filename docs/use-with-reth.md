@@ -33,20 +33,21 @@ where
     let db = Arc::new(db);
     let txs = Arc::new(txs);
 
-    // with_bundle_update = true  -> track transitions so we can extract a BundleState afterwards
-    // update_db_metrics  = false -> set true to record the `grevm.db_latency_us` metric
-    let state = ParallelState::new(db.clone(), true, false);
+    // Block-scoped state tracks transitions and bundles. Provider latency metrics stay disabled;
+    // use ParallelState::new when an integration deliberately needs another combination.
+    let state = ParallelState::for_block(db.clone());
 
     // Dependencies are discovered dynamically from speculative reads and writes. Passing an
     // explicit runtime config keeps block execution independent of process environment variables.
-    let scheduler = Scheduler::new_with_runtime_config(
+    let scheduler = Scheduler::try_new_with_runtime_config(
         cfg,
         env,
         txs,
         state,
         None, // optional custom precompiles
         GrevmConfig::ethereum_block(SchedulerTuning::default()),
-    );
+    )
+    .expect("valid GREVM configuration");
 
     scheduler.execute().expect("block execution failed");
 
@@ -76,8 +77,9 @@ Key signatures:
 use std::sync::Arc;
 
 use grevm::{
-    DynParallelPrecompile, ExecutionProfile, GrevmConfig, GrevmError, ParallelState,
-    ParallelTakeBundle, Scheduler, SchedulerTuning, TxExecutionOutcome,
+    DynParallelPrecompile, ExecutionProfile, ExecutionResources, ExecutionSession, GrevmConfig,
+    GrevmConfigError, GrevmError, ParallelState, ParallelTakeBundle, Scheduler, SchedulerTuning,
+    TxExecutionOutcome,
 };
 use revm::DatabaseRef;
 use revm_context::{BlockEnv, CfgEnv, TxEnv};
@@ -89,32 +91,57 @@ where
     DB: DatabaseRef + Send + Sync,
     DB::Error: Clone + Send + Sync + 'static,
 {
-    pub fn new(
-        cfg: CfgEnv,
-        env: BlockEnv,
-        txs: Arc<Vec<TxEnv>>,
-        state: ParallelState<DB>,
-        custom_precompiles: Option<Arc<Vec<(Address, DynParallelPrecompile)>>>,
-    ) -> Self;
-
-    pub fn new_with_runtime_config(
+    pub fn try_new_with_runtime_config(
         cfg: CfgEnv,
         env: BlockEnv,
         txs: Arc<Vec<TxEnv>>,
         state: ParallelState<DB>,
         custom_precompiles: Option<Arc<Vec<(Address, DynParallelPrecompile)>>>,
         config: GrevmConfig,
-    ) -> Self;
+    ) -> Result<Self, GrevmConfigError>;
+
+    pub fn try_new_with_runtime_config_and_resources(
+        cfg: CfgEnv,
+        env: BlockEnv,
+        txs: Arc<Vec<TxEnv>>,
+        state: ParallelState<DB>,
+        custom_precompiles: Option<Arc<Vec<(Address, DynParallelPrecompile)>>>,
+        config: GrevmConfig,
+        resources: ExecutionResources,
+    ) -> Result<Self, GrevmConfigError>;
 
     pub fn execute(&self) -> Result<(), GrevmError<DB::Error>>;
 
     pub fn take_result_and_state(self) -> (Vec<TxExecutionOutcome>, ParallelState<DB>);
 }
 
+impl<DB> ExecutionSession<DB>
+where
+    DB: DatabaseRef + Send + Sync,
+    DB::Error: Clone + Send + Sync + 'static,
+{
+    pub fn try_new(
+        cfg: CfgEnv,
+        block: BlockEnv,
+        state: ParallelState<DB>,
+        custom_precompiles: Option<Arc<Vec<(Address, DynParallelPrecompile)>>>,
+        config: GrevmConfig,
+    ) -> Result<Self, GrevmConfigError>;
+
+    pub fn try_new_with_resources(
+        cfg: CfgEnv,
+        block: BlockEnv,
+        state: ParallelState<DB>,
+        custom_precompiles: Option<Arc<Vec<(Address, DynParallelPrecompile)>>>,
+        config: GrevmConfig,
+        resources: ExecutionResources,
+    ) -> Result<Self, GrevmConfigError>;
+}
+
 impl<DB: DatabaseRef> ParallelState<DB> {
+    pub fn for_block(database: DB) -> Self;
     pub fn new(database: DB, with_bundle_update: bool, update_db_metrics: bool) -> Self;
     pub const fn database(&self) -> &DB;
-    pub const fn database_mut(&mut self) -> &mut DB;
     pub fn into_database(self) -> DB;
 }
 
@@ -131,8 +158,8 @@ impl<DB: DatabaseRef> ParallelTakeBundle for ParallelState<DB> {
 ```
 
 Public items re-exported from the crate root include `Scheduler`, `ExecutionSession`,
-`BatchExecutionResult`, `ConcurrentDatabase`, `DatabaseFactory`, `ReadCache`, `GrevmConfig`,
-`SchedulerTuning`, `ExecutionProfile`, `InvalidTransactionPolicy`,
+`BatchExecutionResult`, `ExecutionResources`, `ConcurrentDatabase`, `DatabaseFactory`, `ReadCache`,
+`GrevmConfig`, `GrevmConfigError`, `SchedulerTuning`, `ExecutionProfile`, `InvalidTransactionPolicy`,
 `DelegatedSafetyConfig`, `ParallelState`, `ParallelCacheState`, `TxExecutionOutcome`,
 `InvalidTransaction`, `GrevmError`, `ParallelPrecompile`, `DynParallelPrecompile`,
 `ParallelPrecompileInput`, `ParallelPrecompileState`, `ParallelPrecompileResult`, and
@@ -152,14 +179,15 @@ use grevm::{
 };
 
 let tuning = SchedulerTuning::default();
-let state = ParallelState::new(database, true, false);
-let mut session = ExecutionSession::new(
+let state = ParallelState::for_block(database);
+let mut session = ExecutionSession::try_new(
     cfg,
     block,
     state,
     None,
     GrevmConfig::ethereum_builder(tuning),
-);
+)
+.expect("valid GREVM configuration");
 
 match session.execute_batch_with_cancellation(candidates, || cancel.is_interrupted()) {
     BatchExecutionResult::Complete(outcomes) => consume(outcomes),
@@ -181,7 +209,8 @@ scheduler boundaries; it does not preempt an EVM invocation already in progress.
 
 `ConcurrentDatabase` provides one lazily created `DatabaseRef` handle per worker thread and a
 shared key-level single-flight `ReadCache`. This is the storage boundary for integrations whose
-provider handle is `Send` but not `Sync`:
+provider handle is `Send` but not `Sync`. Every handle returned by the factory, and every seeded
+cache entry, must represent the same immutable state snapshot:
 
 ```rust
 use grevm::{ConcurrentDatabase, ReadCache};
@@ -193,21 +222,26 @@ let database = ConcurrentDatabase::with_cache(
 );
 let database_handle = database.clone();
 
-// Build ParallelState / ExecutionSession over `database`.
+// Build ParallelState / ExecutionSession over `database` for this parent-state snapshot only.
 // After every synchronous batch, all scheduler threads have joined:
 database_handle.clear_thread_databases();
 ```
 
 Successful cache entries can be seeded and exported through `account_reads`, `storage_reads`,
-`code_reads`, and `block_hash_reads`. Errors are single-flight within an attempt but are not
-exported to the next attempt.
+`code_reads`, and `block_hash_reads`. Both successes and errors remain cached for the lifetime of
+that `ReadCache`; export iterators omit errors. A retry after a database or factory error must create
+a fresh `ReadCache` and may seed it with successful exports from the failed attempt. Never reuse a
+cache for another block or parent state. `clear_thread_databases` releases worker handles but does
+not clear cached reads.
 
 Grevm 3 keeps `ParallelState` internals private. Integrations use its state/BAL/hook/bundle methods,
-the controlled `cache()`/`cache_mut()` preload API, and `database()`/`into_database()` instead of
-mutating cache maps or transition fields directly. This prevents external code from breaking the
-account/storage replacement invariant.
+its typed preload methods, the read-only `cache()` snapshot API, and
+`database()`/`into_database()` instead of mutating cache maps or transition fields directly.
+Canonical EVM output is committed through `DatabaseCommit::commit`, which keeps the cache,
+transition tracking, state hook, and BAL builder synchronized.
 
-The canonical `new_with_runtime_config` path uses only the supplied `GrevmConfig`.
+The canonical `try_new_with_runtime_config` path validates and uses only the supplied
+`GrevmConfig`. `ExecutionSession::try_new` provides the same validation for batched execution.
 `Scheduler::new` and explicit `GrevmConfig::from_env()` opt into environment variables
 (`GREVM_MIN_PARALLEL_TXS`, `GREVM_FALLBACK_SEQUENTIAL`, `GREVM_CONCURRENT_LEVEL`). See
 [Testing & Benchmarking](testing.md#environment-variable-knobs) for the full list and a working
@@ -225,16 +259,22 @@ instead of setting `InvalidTransactionPolicy` and `DelegatedSafetyConfig` indepe
 | `GrevmConfig::gravity(tuning)` | Gravity execution | Include as no-op | Enabled |
 
 The Ethereum constructors always set both `forbid_delegated_create` and
-`reserve_delegated_balance` to `false`, preserving upstream revm semantics independently of JIT or
-AOT selection. The legacy field setters remain available for compatibility and specialized
-protocol experiments, but new integrations should use a named profile.
+`reserve_delegated_balance` to `false`. The normal public configuration API keeps these semantic
+fields private, so an Ethereum integration selects the complete builder or fixed-block profile
+rather than overriding either guard independently. Gravity is the only named profile that enables
+the guards.
 
-## Optional delegated-account policy
+This gives Grevm stock-revm semantic compatibility with blocks executed by Reth's JIT or AOT
+backends; it is not backend reuse. Grevm currently constructs its own stock revm EVM and does not
+invoke Reth's `EvmFactory` or revmc runtime. Deployments that enable JIT/AOT elsewhere in Reth should
+retain differential tests against the Grevm path; injecting Reth's execution backend would require
+a separate Grevm factory abstraction.
 
-`DelegatedSafetyConfig` contains two Grevm/Gravity-specific, opt-in EIP-7702 policies. Both are
-disabled by default to preserve stock revm/Ethereum execution semantics. They are automatically
-inactive before Prague, so one block-scoped policy configuration can safely be reused while
-replaying historical blocks:
+## Gravity delegated-account policy
+
+`DelegatedSafetyConfig` describes two Grevm/Gravity-specific EIP-7702 policies. Both Ethereum named
+profiles keep them disabled. They are automatically inactive before Prague, so the Gravity profile
+can be reused while replaying older Gravity blocks without changing pre-Prague behavior:
 
 - `forbid_delegated_create` makes `CREATE` and `CREATE2` halt as not activated while executing in a
   delegated account's context.
@@ -251,8 +291,35 @@ use grevm::{GrevmConfig, SchedulerTuning};
 let config = GrevmConfig::gravity(SchedulerTuning::default());
 ```
 
-`with_delegated_safety` remains available when a Gravity deployment intentionally needs only one
-of the two guards.
+Normal integrations select these two guards together through the named Gravity profile; Ethereum
+builder, validator, and history-sync integrations must use the corresponding Ethereum profile.
+
+## Production readiness gates
+
+An immutable Git revision is suitable for integration development, but a Reth upstream submission
+should depend on a release or revision from the agreed canonical Grevm repository. The package
+metadata, installation documentation, tag, and dependency URL must identify the same maintained
+source; publish or tag the reviewed Grevm 3 API before treating the dependency as stable.
+
+Every normal scheduler and session shares `ExecutionResources::process_default()`. Its FIFO,
+cancellation-aware budget caps active GREVM execution roles across concurrent payload, validation,
+and history jobs at the process's reported logical parallelism. Parallel execution reserves two
+coordinator roles; `SchedulerTuning::concurrency_level` is a worker upper bound, and fewer than four
+available roles selects the one-slot sequential path. Embedders that already partition CPU can
+inject a shared `ExecutionResources::dedicated(...)` through the explicit constructors.
+
+A scheduler must not synchronously start another scheduler that uses the same resource budget from
+inside a database callback, state hook, or custom precompile. The outer scheduler retains its
+permit while waiting for that callback, so a nested acquisition can deadlock. Integrations that
+cannot avoid synchronous nesting must use an independent dedicated budget for the inner work and
+account for the combined CPU limit themselves.
+
+The budget does not yet replace per-batch OS thread creation, and bundle preparation can also use
+the process-wide Rayon pool. Validate both costs with representative payload-build benchmarks and
+soak tests, including cancellation, sequential fallback, provider read-handle limits, memory
+high-water marks, simultaneous state-root work, and multiple batches per block. A reusable
+session-private scheduler runtime is a separate optimization because it changes borrowed-state,
+panic-propagation, and shutdown lifetimes.
 
 ## Integration with reth
 
@@ -287,6 +354,9 @@ not process-lifetime totals; `execution_time` is omitted on purely sequential pa
 | `grevm.one_attempt_with_dependency` | Dependent transactions finalized on the first incarnation. |
 | `grevm.more_attempts_with_dependency` | Dependent transactions needing more than two incarnations. |
 | `grevm.conflict_txs` | Number of conflicting transactions. |
+| `grevm.resource_wait_time` | Time acquiring the selected execution-role budget, including an interrupted wait (nanoseconds). |
+| `grevm.parallel_worker_cnt` | Actual speculative workers granted for this execution. |
+| `grevm.resource_sequential_fallback` | One when an eligible parallel execution was downgraded because fewer than two workers could be allocated. |
 | `grevm.execution_time` | Parallel finality-loop duration from block start (nanoseconds; omitted on the sequential path). |
 | `grevm.commit_time` | Cumulative ordered-commit attempt time for the block (nanoseconds). |
 | `grevm.total_time` | End-to-end scheduler duration, including recovery replay (nanoseconds). |

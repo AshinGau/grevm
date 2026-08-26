@@ -12,6 +12,7 @@ use revm_primitives::{B256, Bytes, TxKind, U256, hardfork::SpecId};
 use revm_state::{Account, AccountInfo, Bytecode, EvmState};
 use std::{
     fmt::{Display, Formatter},
+    num::NonZeroUsize,
     sync::{
         Arc as StdArc, Barrier,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -133,6 +134,21 @@ fn scheduler_returns_an_error_for_a_second_execution() {
 }
 
 #[test]
+fn scheduler_try_constructor_rejects_zero_concurrency() {
+    let config = GrevmConfig { concurrency_level: 0, ..GrevmConfig::default() };
+    let result = Scheduler::try_new_with_runtime_config(
+        CfgEnv::new_with_spec(SpecId::SHANGHAI),
+        BlockEnv::default(),
+        Arc::new(Vec::new()),
+        ParallelState::for_block(EmptyDB::default()),
+        None,
+        config,
+    );
+
+    assert!(matches!(result, Err(crate::GrevmConfigError::ZeroConcurrency)));
+}
+
+#[test]
 fn cancellation_is_distinguishable_in_parallel_and_sequential_modes() {
     for force_sequential in [false, true] {
         let cancelled = StdArc::new(AtomicBool::new(true));
@@ -234,18 +250,21 @@ fn speculative_worker_panic_cancels_peers_without_becoming_an_abort_reason() {
         ..Default::default()
     };
     let config =
-        GrevmConfig { concurrency_level: 1, min_parallel_txs: 0, ..GrevmConfig::default() };
-    let scheduler = Scheduler::new_with_runtime_config(
+        GrevmConfig { concurrency_level: 2, min_parallel_txs: 0, ..GrevmConfig::default() };
+    let resources = ExecutionResources::dedicated(NonZeroUsize::new(4).unwrap());
+    let scheduler = Scheduler::try_new_with_runtime_config_and_resources(
         CfgEnv::new_with_spec(SpecId::SHANGHAI),
         BlockEnv { beneficiary, ..Default::default() },
         Arc::new(vec![tx]),
         ParallelState::new(WorkerPanicDb { beneficiary }, true, false),
         None,
         config,
-    );
+        resources.clone(),
+    )
+    .unwrap();
 
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        scheduler.parallel_execute(Some(1))
+        scheduler.parallel_execute(Some(2))
     }))
     .expect_err("the original worker panic must reach the caller");
     assert_eq!(panic.downcast_ref::<&str>().copied(), Some("injected speculative worker panic"),);
@@ -254,6 +273,7 @@ fn speculative_worker_panic_cancels_peers_without_becoming_an_abort_reason() {
         scheduler.abort_reason.get().is_none(),
         "a panic must not masquerade as a recoverable execution error"
     );
+    assert_eq!(resources.available(), resources.capacity().get());
 }
 
 #[test]
@@ -268,6 +288,45 @@ fn fallback_then_execute_is_rejected_without_replaying_results() {
         EVMError::Custom(message) if message.contains("can execute only once")
     ));
     assert_eq!(scheduler.results.lock().len(), 1, "the block must not be executed twice");
+}
+
+#[test]
+fn explicit_sequential_fallback_obeys_the_execution_budget() {
+    let resources = ExecutionResources::dedicated(NonZeroUsize::MIN);
+    let mut occupied = Some(resources.acquire(None));
+    let scheduler = Scheduler::try_new_with_runtime_config_and_resources(
+        CfgEnv::new_with_spec(SpecId::SHANGHAI),
+        BlockEnv::default(),
+        Arc::new(Vec::new()),
+        ParallelState::for_block(EmptyDB::default()),
+        None,
+        GrevmConfig::default(),
+        resources.clone(),
+    )
+    .unwrap();
+    let (completed_tx, completed_rx) = mpsc::channel();
+
+    let (queued, blocked, completed) = std::thread::scope(|scope| {
+        scope.spawn(|| completed_tx.send(scheduler.fallback_sequential()).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut queued = true;
+        while resources.waiter_count() != 1 {
+            if Instant::now() >= deadline {
+                queued = false;
+                break
+            }
+            std::thread::yield_now();
+        }
+        let early = completed_rx.try_recv().ok();
+        let blocked = early.is_none();
+        drop(occupied.take());
+        let completed = early.or_else(|| completed_rx.recv_timeout(Duration::from_secs(1)).ok());
+        (queued, blocked, completed)
+    });
+
+    assert!(queued, "timed out waiting for execution resources");
+    assert!(blocked, "fallback completed before the held permit was released");
+    completed.expect("fallback did not complete after permit release").unwrap();
 }
 
 #[test]
@@ -596,7 +655,7 @@ fn execution_metrics_are_reported_once_for_sequential_and_error_paths() {
 fn parallel_error_replays_suffix_from_committed_prefix() {
     let caller = Address::from([0xCA; 20]);
     let receiver = Address::from([0xCB; 20]);
-    let state = ParallelState::new(EmptyDB::default(), true, false);
+    let mut state = ParallelState::new(EmptyDB::default(), true, false);
     state.insert_account(
         caller,
         AccountInfo { balance: U256::from(1_000_000), nonce: 1, ..Default::default() },
@@ -749,7 +808,7 @@ fn precompile_reads_are_incarnation_stable_and_conflicts_retry() {
         nonce: 1,
         ..Default::default()
     };
-    let scheduler = Scheduler::new_with_runtime_config(
+    let scheduler = Scheduler::try_new_with_runtime_config_and_resources(
         CfgEnv::new_with_spec(SpecId::SHANGHAI),
         BlockEnv { beneficiary: account::MINER_ADDRESS, ..Default::default() },
         Arc::new(vec![tx(0, writer_precompile), tx(1, reader_precompile)]),
@@ -762,7 +821,9 @@ fn precompile_reads_are_incarnation_stable_and_conflicts_retry() {
             invalid_transaction_policy: InvalidTransactionPolicy::IncludeNoop,
             delegated_safety: DelegatedSafetyConfig::disabled(),
         },
-    );
+        ExecutionResources::dedicated(NonZeroUsize::new(4).unwrap()),
+    )
+    .unwrap();
 
     let (reader_started, writer_committed, execution) = std::thread::scope(|scope| {
         let execution = scope.spawn(|| scheduler.execute());

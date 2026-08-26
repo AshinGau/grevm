@@ -1,4 +1,5 @@
 use crate::DelegatedSafetyConfig;
+use std::fmt;
 
 /// Policy for a transaction that is invalid against the ordered committed state.
 ///
@@ -28,7 +29,10 @@ pub enum InvalidTransactionPolicy {
 /// behavior cannot be accidentally inherited from performance tuning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SchedulerTuning {
-    /// Number of speculative execution workers.
+    /// Requested upper bound for speculative execution workers.
+    ///
+    /// The actual worker count is limited by the shared [`crate::ExecutionResources`] budget and
+    /// may fall back to sequential execution when fewer than two workers can be allocated.
     pub concurrency_level: usize,
     /// Execute the whole block through the sequential path.
     pub force_sequential: bool,
@@ -45,6 +49,14 @@ impl SchedulerTuning {
             force_sequential: env_or("GREVM_FALLBACK_SEQUENTIAL", defaults.force_sequential),
             min_parallel_txs: env_or("GREVM_MIN_PARALLEL_TXS", defaults.min_parallel_txs),
         }
+    }
+
+    /// Validates scheduler invariants before worker resources are allocated.
+    pub const fn validate(self) -> Result<(), GrevmConfigError> {
+        if self.concurrency_level == 0 {
+            return Err(GrevmConfigError::ZeroConcurrency)
+        }
+        Ok(())
     }
 }
 
@@ -122,20 +134,24 @@ impl Default for ExecutionProfile {
 ///
 /// Environment variables are read once when [`Self::from_env`] is called. Callers that need
 /// consensus-stable behavior should construct this value explicitly and pass it to
-/// [`crate::Scheduler::new_with_runtime_config`]. New integrations should use [`Self::new`] or a
-/// named profile constructor; the public fields are retained for source compatibility.
+/// [`crate::Scheduler::try_new_with_runtime_config`]. Chain-sensitive fields are crate-private so
+/// integrations must select a complete named profile; scheduler tuning remains directly
+/// inspectable for compatibility.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GrevmConfig {
-    /// Number of speculative execution workers.
+    /// Requested upper bound for speculative execution workers.
+    ///
+    /// The actual worker count is limited by the shared [`crate::ExecutionResources`] budget and
+    /// may fall back to sequential execution when fewer than two workers can be allocated.
     pub concurrency_level: usize,
     /// Execute the whole block through the sequential path.
     pub force_sequential: bool,
     /// Blocks smaller than this threshold use the sequential path.
     pub min_parallel_txs: usize,
     /// How invalid transactions affect execution and the EIP-7928 block index.
-    pub invalid_transaction_policy: InvalidTransactionPolicy,
+    pub(crate) invalid_transaction_policy: InvalidTransactionPolicy,
     /// EIP-7702 delegated-account safety policy.
-    pub delegated_safety: DelegatedSafetyConfig,
+    pub(crate) delegated_safety: DelegatedSafetyConfig,
 }
 
 impl GrevmConfig {
@@ -179,6 +195,21 @@ impl GrevmConfig {
         }
     }
 
+    /// Validates scheduler invariants before worker resources are allocated.
+    pub const fn validate(&self) -> Result<(), GrevmConfigError> {
+        self.scheduler_tuning().validate()
+    }
+
+    /// Returns how invalid transactions affect execution and block indexing.
+    pub const fn invalid_transaction_policy(&self) -> InvalidTransactionPolicy {
+        self.invalid_transaction_policy
+    }
+
+    /// Returns the delegated-account policy selected by the execution profile.
+    pub const fn delegated_safety(&self) -> DelegatedSafetyConfig {
+        self.delegated_safety
+    }
+
     /// Replaces all performance settings without changing execution semantics.
     pub const fn with_scheduler_tuning(mut self, tuning: SchedulerTuning) -> Self {
         self.concurrency_level = tuning.concurrency_level;
@@ -194,13 +225,15 @@ impl GrevmConfig {
         self
     }
 
-    /// Overrides the delegated-account policy while preserving all execution settings.
+    /// Overrides the delegated-account policy for compatibility and policy tests.
+    #[cfg(test)]
     pub fn with_delegated_safety(mut self, delegated_safety: DelegatedSafetyConfig) -> Self {
         self.delegated_safety = delegated_safety;
         self
     }
 
-    /// Configure how invalid transactions affect execution and block indexing.
+    /// Overrides invalid-transaction behavior for compatibility and policy tests.
+    #[cfg(test)]
     pub const fn with_invalid_transaction_policy(
         mut self,
         policy: InvalidTransactionPolicy,
@@ -209,6 +242,25 @@ impl GrevmConfig {
         self
     }
 }
+
+/// Invalid GREVM runtime configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrevmConfigError {
+    /// At least one execution worker is required.
+    ZeroConcurrency,
+}
+
+impl fmt::Display for GrevmConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroConcurrency => {
+                f.write_str("GREVM concurrency level must be greater than zero")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GrevmConfigError {}
 
 impl Default for GrevmConfig {
     fn default() -> Self {
@@ -258,6 +310,17 @@ mod tests {
         assert_eq!(gravity.invalid_transaction_policy, InvalidTransactionPolicy::IncludeNoop);
         assert_eq!(gravity.delegated_safety, DelegatedSafetyConfig::enabled());
         assert_eq!(gravity.scheduler_tuning(), tuning);
+    }
+
+    #[test]
+    fn zero_concurrency_is_rejected() {
+        let tuning = SchedulerTuning { concurrency_level: 0, ..SchedulerTuning::default() };
+
+        assert_eq!(tuning.validate(), Err(GrevmConfigError::ZeroConcurrency));
+        assert_eq!(
+            GrevmConfig::ethereum_builder(tuning).validate(),
+            Err(GrevmConfigError::ZeroConcurrency),
+        );
     }
 
     #[test]

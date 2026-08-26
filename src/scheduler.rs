@@ -19,10 +19,12 @@ mod tests;
 mod wait;
 
 use crate::{
-    AbortReason, GrevmConfig, GrevmError, LocationAndType, MVMemory, ParallelState, ReadVersion,
-    Task, TransactionResult, TransactionStatus, TxExecutionOutcome, TxId, TxState, TxVersion,
+    AbortReason, ExecutionResources, GrevmConfig, GrevmError, LocationAndType, MVMemory,
+    ParallelState, ReadVersion, Task, TransactionResult, TransactionStatus, TxExecutionOutcome,
+    TxId, TxState, TxVersion,
     beneficiary::Beneficiary,
     delegated_safety::ReservePlanner,
+    execution_resources::ExecutionAllocation,
     incarnation_db::{IncarnationAccesses, IncarnationDb},
     tx_dependency::TxDependency,
 };
@@ -83,6 +85,7 @@ where
     /// documented on [`Scheduler::new`].
     custom_precompiles: Arc<Vec<(Address, crate::DynParallelPrecompile)>>,
     config: GrevmConfig,
+    resources: ExecutionResources,
     reserve_planner: Option<Arc<ReservePlanner>>,
     cancellation: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 
@@ -153,10 +156,18 @@ where
     /// only through journal-aware operations, so account lifecycle flags, read-your-writes,
     /// conflict tracking, and rollback remain visible to Grevm. Read-only access to immutable
     /// block-scoped data is also safe. A precompile must not keep mutable consensus state in its
-    /// shared closure or mutate account/storage state through any out-of-band handle.
+    /// shared closure or mutate account/storage state through any out-of-band handle. It must also
+    /// not synchronously invoke another scheduler that shares this scheduler's
+    /// [`ExecutionResources`], because the nested acquisition can deadlock behind the outer
+    /// scheduler's permit.
     ///
     /// This is an integration invariant and is not enforced at runtime. Custom precompiles that do
     /// not satisfy it must not be supplied to the parallel scheduler.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `GREVM_CONCURRENT_LEVEL` parses as zero. Production integrations should prefer
+    /// [`Self::try_new_with_runtime_config`] with an explicitly validated configuration.
     pub fn new(
         cfg: CfgEnv,
         env: BlockEnv,
@@ -189,8 +200,57 @@ where
         custom_precompiles: Option<Arc<Vec<(Address, crate::DynParallelPrecompile)>>>,
         config: GrevmConfig,
     ) -> Self {
-        assert!(config.concurrency_level > 0, "grevm concurrency level must be greater than zero");
-        Self::build(cfg, env, txs, state, custom_precompiles, config)
+        Self::try_new_with_runtime_config(cfg, env, txs, state, custom_precompiles, config)
+            .expect("grevm concurrency level must be greater than zero")
+    }
+
+    /// Tries to create a scheduler with an explicit, block-scoped runtime configuration.
+    ///
+    /// `custom_precompiles` is subject to the retry-safety contract documented on [`Self::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::GrevmConfigError`] when `config` violates scheduler invariants.
+    pub fn try_new_with_runtime_config(
+        cfg: CfgEnv,
+        env: BlockEnv,
+        txs: Arc<Vec<TxEnv>>,
+        state: ParallelState<DB>,
+        custom_precompiles: Option<Arc<Vec<(Address, crate::DynParallelPrecompile)>>>,
+        config: GrevmConfig,
+    ) -> Result<Self, crate::GrevmConfigError> {
+        Self::try_new_with_runtime_config_and_resources(
+            cfg,
+            env,
+            txs,
+            state,
+            custom_precompiles,
+            config,
+            ExecutionResources::process_default(),
+        )
+    }
+
+    /// Tries to create a scheduler with explicit runtime configuration and execution resources.
+    ///
+    /// Use a dedicated resource budget only when the embedding application intentionally isolates
+    /// GREVM work. Normal integrations should share [`ExecutionResources::process_default`]
+    /// through [`Self::try_new_with_runtime_config`].
+    /// `custom_precompiles` is subject to the retry-safety contract documented on [`Self::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::GrevmConfigError`] when `config` violates scheduler invariants.
+    pub fn try_new_with_runtime_config_and_resources(
+        cfg: CfgEnv,
+        env: BlockEnv,
+        txs: Arc<Vec<TxEnv>>,
+        state: ParallelState<DB>,
+        custom_precompiles: Option<Arc<Vec<(Address, crate::DynParallelPrecompile)>>>,
+        config: GrevmConfig,
+        resources: ExecutionResources,
+    ) -> Result<Self, crate::GrevmConfigError> {
+        config.validate()?;
+        Ok(Self::build(cfg, env, txs, state, custom_precompiles, config, resources))
     }
 
     fn build(
@@ -200,6 +260,7 @@ where
         state: ParallelState<DB>,
         custom_precompiles: Option<Arc<Vec<(Address, crate::DynParallelPrecompile)>>>,
         mut config: GrevmConfig,
+        resources: ExecutionResources,
     ) -> Self {
         let num_txs = txs.len();
         // The configuration may be shared across historical and current blocks. EIP-7702 safety
@@ -225,6 +286,7 @@ where
             scheduler_ctx: SchedulerContext::new(num_txs),
             custom_precompiles: custom_precompiles.unwrap_or_else(|| Arc::new(Vec::new())),
             config,
+            resources,
             reserve_planner,
             cancellation: None,
             started: AtomicBool::new(false),
@@ -457,6 +519,28 @@ where
         self.abort(AbortReason::FallbackSequential);
     }
 
+    fn acquire_execution_resources(
+        &self,
+        desired_parallel_workers: Option<usize>,
+        cancellation: CancellationCheck<'_>,
+    ) -> Result<ExecutionAllocation, GrevmError<DB::Error>> {
+        let started = Instant::now();
+        let allocation = if cancellation.is_some() || self.cancellation.is_some() {
+            self.resources.acquire_with_cancellation(desired_parallel_workers, || {
+                self.poll_cancellation(cancellation)
+            })
+        } else {
+            Some(self.resources.acquire(desired_parallel_workers))
+        };
+        self.metrics.record_resource_wait(started.elapsed());
+        let Some(allocation) = allocation else {
+            return Err(GrevmError::cancelled(
+                self.scheduler_ctx.committed_idx().min(self.block_size.saturating_sub(1)),
+            ))
+        };
+        Ok(allocation)
+    }
+
     fn parallel_execute_inner(
         &self,
         concurrency_level: usize,
@@ -466,9 +550,19 @@ where
         if self.poll_cancellation(cancellation) {
             return Err(GrevmError::cancelled(0))
         }
-        if self.config.force_sequential || self.block_size < self.config.min_parallel_txs {
+        let desired_parallel_workers = (!self.config.force_sequential &&
+            self.block_size >= self.config.min_parallel_txs)
+            .then_some(concurrency_level);
+        let mut allocation =
+            self.acquire_execution_resources(desired_parallel_workers, cancellation)?;
+        let ExecutionAllocation::Parallel { workers, .. } = &allocation else {
+            if desired_parallel_workers.is_some() {
+                self.metrics.record_resource_sequential_fallback();
+            }
             return self.replay_uncommitted_suffix(CommittedPrefixEnd::ZERO, cancellation);
-        }
+        };
+        let concurrency_level = workers.get();
+        self.metrics.record_parallel_workers(concurrency_level);
         let commit_thread_result = {
             // Spawn `concurrency_level` speculative workers plus one finality coordinator and one
             // ordered commit thread. Workers and commit share the concurrent cache/database view;
@@ -588,6 +682,9 @@ where
                 commit_result.expect("commit result exists when no scheduler thread panicked")
             })
         };
+        // Every spawned role has joined. Keep only the caller's sequential slot while installing
+        // the prefix and, when necessary, replaying the authoritative suffix.
+        allocation.retain_sequential_role();
         let committed = self.install_commit_loop_result(commit_thread_result)?;
         // Recover or replay from the authoritative committed boundary recorded above.
         self.post_execute(committed, cancellation)?;

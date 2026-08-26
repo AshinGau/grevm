@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94.1"
 description = "Block-STM-inspired parallel EVM execution engine"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/Galxe/grevm"
+repository = "https://github.com/AshinGau/grevm"
 exclude = ["test_data"]
 # The fetcher binaries share `src/bin/rpc.rs`; disable bin auto-discovery so it isn't treated as
 # its own binary target, and declare the real binaries explicitly below.

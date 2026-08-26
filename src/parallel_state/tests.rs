@@ -65,7 +65,7 @@ fn account_insertions_replace_cached_storage() {
     let first_slot = U256::from(1);
     let second_slot = U256::from(2);
     let info = AccountInfo { nonce: 1, ..Default::default() };
-    let state = ParallelState::new(EmptyDB::default(), false, false);
+    let mut state = ParallelState::new(EmptyDB::default(), false, false);
 
     state.insert_account_with_storage(
         address,
@@ -165,21 +165,6 @@ fn canonical_cache_only_persists_changed_storage_slots() {
         assert_eq!(*storage.get(&U256::from(1)).unwrap(), U256::from(3));
         assert!(!storage.contains_key(&U256::from(4)));
     }
-}
-
-#[test]
-fn compatibility_apply_apis_preserve_transition_output() {
-    let address = Address::with_last_byte(0x42);
-    let changes = changed_account_state(address, 1, 2, 3, 4);
-    let mut state = ParallelState::new(EmptyDB::default(), true, false);
-
-    let transitions = state.cache.apply_evm_state(changes);
-    state.apply_transition(transitions);
-
-    let transitions = &state.transition_state.as_ref().unwrap().transitions;
-    let transition = transitions.get(&address).unwrap();
-    assert_eq!(transition.current_balance(), U256::from(2));
-    assert_eq!(transition.storage.len(), 1);
 }
 
 #[test]

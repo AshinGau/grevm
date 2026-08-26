@@ -2,13 +2,13 @@ mod cache;
 #[cfg(test)]
 mod tests;
 
-use cache::{CacheAccountInfo, into_revm_transition};
+use cache::CacheAccountInfo;
 use core::hash::{BuildHasherDefault, Hasher};
 use dashmap::{DashMap, Entry};
 use metrics::histogram;
 use revm::{Database, DatabaseCommit, DatabaseRef, OnStateHook, database_interface::bal::BalState};
 use revm_database::{
-    AccountStatus, BundleState, DatabaseCommitExt, TransitionAccount, TransitionState,
+    AccountStatus, BundleState, DatabaseCommitExt, TransitionState,
     states::{bundle_state::BundleRetention, plain_account::PlainStorage},
 };
 use revm_primitives::{Address, B256, U256};
@@ -329,24 +329,18 @@ impl<DB> std::fmt::Debug for ParallelState<DB> {
 }
 
 impl<DB> ParallelState<DB> {
-    /// Returns the controlled preload and compatibility cache API.
+    /// Returns a read-only view of the canonical cache.
+    ///
+    /// Preload state through the typed methods on [`ParallelState`]. Canonical EVM output must be
+    /// applied through [`DatabaseCommit::commit`] so transition tracking, the state hook, and BAL
+    /// construction remain synchronized.
     pub const fn cache(&self) -> &ParallelCacheState {
         &self.cache
-    }
-
-    /// Returns mutable access to the controlled cache API.
-    pub const fn cache_mut(&mut self) -> &mut ParallelCacheState {
-        &mut self.cache
     }
 
     /// Returns the backing database.
     pub const fn database(&self) -> &DB {
         &self.database
-    }
-
-    /// Returns mutable access to the backing database while the state is exclusively borrowed.
-    pub const fn database_mut(&mut self) -> &mut DB {
-        &mut self.database
     }
 
     /// Consumes the state and returns its backing database.
@@ -358,12 +352,20 @@ impl<DB> ParallelState<DB> {
     }
 
     /// Inserts or replaces a cached block hash used by EVM `BLOCKHASH` reads.
-    pub fn insert_block_hash(&self, number: u64, hash: B256) -> Option<B256> {
+    pub fn insert_block_hash(&mut self, number: u64, hash: B256) -> Option<B256> {
         self.block_hashes.insert(number, hash)
     }
 }
 
 impl<DB: DatabaseRef> ParallelState<DB> {
+    /// Creates block-scoped state with transition and bundle tracking enabled.
+    ///
+    /// Database-latency metrics are disabled because integrations commonly provide their own
+    /// provider metrics. Use [`Self::new`] when a different combination is required.
+    pub fn for_block(database: DB) -> Self {
+        Self::new(database, true, false)
+    }
+
     /// Create a ParallelState
     /// #Parameters
     /// - `database`: the inner database to read the data not in cache
@@ -495,38 +497,23 @@ impl<DB: DatabaseRef> ParallelState<DB> {
     }
 
     /// Insert non-existent account
-    pub fn insert_not_existing(&self, address: Address) {
+    pub fn insert_not_existing(&mut self, address: Address) {
         self.cache.insert_not_existing(address)
     }
 
     /// Insert account with specified `AccountInfo`
-    pub fn insert_account(&self, address: Address, info: AccountInfo) {
+    pub fn insert_account(&mut self, address: Address, info: AccountInfo) {
         self.cache.insert_account(address, info)
     }
 
     /// Insert account with `AccountInfo` and `PlainStorage`
     pub fn insert_account_with_storage(
-        &self,
+        &mut self,
         address: Address,
         info: AccountInfo,
         storage: PlainStorage,
     ) {
         self.cache.insert_account_with_storage(address, info, storage)
-    }
-
-    /// Add already constructed account transitions to the block transition state.
-    ///
-    /// This compatibility API is retained for integrations that applied
-    /// [`ParallelCacheState::apply_evm_state`] separately. New code should prefer
-    /// [`DatabaseCommit::commit`], which also updates the BAL builder and state hook.
-    pub fn apply_transition(&mut self, transitions: Vec<(Address, TransitionAccount)>) {
-        if let Some(state) = self.transition_state.as_mut() {
-            state.add_transitions(
-                transitions
-                    .into_iter()
-                    .map(|(address, transition)| (address, into_revm_transition(transition))),
-            );
-        }
     }
 
     /// Take all transitions and merge them inside bundle state.
