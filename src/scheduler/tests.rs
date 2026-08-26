@@ -385,6 +385,63 @@ fn successful_speculative_result() -> SpeculativeResult {
 }
 
 #[test]
+fn external_cancellation_retains_nonzero_committed_prefix() {
+    let cancelled = StdArc::new(AtomicBool::new(false));
+    let cancellation = cancelled.clone();
+    let scheduler =
+        empty_scheduler(2).with_cancellation(move || cancellation.load(Ordering::Acquire));
+    for tx_result in &scheduler.tx_results {
+        *tx_result.lock() = Some(TransactionResult {
+            read_set: Default::default(),
+            write_set: Default::default(),
+            execute_result: Ok(successful_speculative_result()),
+        });
+    }
+    // Publish only the first result so commit must park with a non-zero prefix while the second
+    // result remains uncommitted.
+    scheduler.scheduler_ctx.publish_finality(1);
+
+    let (observed_prefix, run) = std::thread::scope(|scope| {
+        let commit = scope.spawn(|| {
+            let mut state = scheduler.state.lock();
+            let (_, commit_state) = state.split_for_parallel();
+            let mut committer = OrderedCommitter::new(Address::ZERO, commit_state, false);
+            scheduler.run_commit_loop(&mut committer)
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let observed_prefix = loop {
+            if scheduler.scheduler_ctx.committed_idx() == 1 {
+                break true
+            }
+            if Instant::now() >= deadline {
+                break false
+            }
+            std::thread::yield_now();
+        };
+        // Always release the commit thread, including on timeout, so a failed assertion cannot
+        // strand this scoped thread in the test process.
+        cancelled.store(true, Ordering::Release);
+        scheduler.commit_wait.notify();
+        (observed_prefix, commit.join().expect("commit thread"))
+    });
+    assert!(observed_prefix, "the first transaction was not committed before cancellation");
+    assert!(run.error.is_none());
+    assert_eq!(run.committed.end(), CommittedPrefixEnd::for_test(1));
+
+    let committed = scheduler
+        .install_commit_loop_result(run)
+        .expect("cancellation must preserve the installed prefix");
+    let error = scheduler.post_execute(committed).expect_err("cancellation must be reported");
+    assert!(error.is_cancelled());
+
+    assert!(scheduler.tx_results[1].lock().is_some());
+    let (outcomes, state) = scheduler.take_result_and_state();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(state.bal_index().get(), 1);
+}
+
+#[test]
 fn ordered_commit_database_error_aborts_and_returns_exact_error() {
     let caller = Address::from([0xCA; 20]);
     let beneficiary = Address::from([0xCB; 20]);
