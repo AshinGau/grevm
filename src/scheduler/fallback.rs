@@ -137,13 +137,25 @@ where
                     };
                 }
                 Err(EVMError::Transaction(error)) => {
-                    tracing::error!(
-                        target: "grevm::scheduler",
-                        block_number = %self.env.number,
-                        txid,
-                        ?error,
-                        "skipping invalid transaction during sequential fallback",
-                    );
+                    match self.config.invalid_transaction_policy {
+                        InvalidTransactionPolicy::Omit => tracing::trace!(
+                            target: "grevm::scheduler",
+                            block_number = %self.env.number,
+                            txid,
+                            ?error,
+                            "omitting invalid transaction during sequential fallback",
+                        ),
+                        InvalidTransactionPolicy::IncludeNoop => tracing::debug!(
+                            target: "grevm::scheduler",
+                            block_number = %self.env.number,
+                            txid,
+                            ?error,
+                            "retaining invalid transaction as a no-op during sequential fallback",
+                        ),
+                        InvalidTransactionPolicy::Abort => {
+                            unreachable!("abort policy returned from the preceding branch")
+                        }
+                    }
                     TxExecutionOutcome::Skipped(error)
                 }
                 Err(error) => {
