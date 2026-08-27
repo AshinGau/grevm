@@ -20,6 +20,7 @@ mod account;
 mod beneficiary;
 mod bundle;
 mod config;
+mod database;
 mod delegated_safety;
 mod incarnation_db;
 mod model;
@@ -38,6 +39,7 @@ pub(crate) use model::{
 
 pub use bundle::{ParallelBundleState, ParallelTakeBundle};
 pub use config::{GrevmConfig, InvalidTransactionPolicy};
+pub use database::LockedDatabase;
 pub use delegated_safety::DelegatedSafetyConfig;
 pub use outcome::{GrevmError, TxExecutionOutcome};
 pub use parallel_state::{ParallelCacheState, ParallelState};

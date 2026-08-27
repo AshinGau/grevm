@@ -12,7 +12,8 @@ grevm = { git = "https://github.com/Galxe/grevm.git", branch = "main" }
 Grevm's public surface is small: build a `ParallelState` over any read-only database, hand it to a
 `Scheduler` together with the config/block environment and the transactions, then call
 `execute`. The database implements revm's read-only `DatabaseRef` trait and is `Send + Sync`; its
-error type is `Clone + Send + Sync + 'static`.
+error type is `Clone + Send + Sync + 'static`. `LockedDatabase` can serialize reads when the
+underlying database is `Send` but not `Sync`.
 
 ```rust
 use std::sync::Arc;
