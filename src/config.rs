@@ -1,5 +1,17 @@
 use crate::DelegatedSafetyConfig;
 
+/// How a sequential replay handles a transaction that is invalid at the committed state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InvalidTransactionPolicy {
+    /// Return the invalid transaction as an execution error.
+    #[default]
+    Abort,
+    /// Return a skipped outcome without reserving a block position.
+    Omit,
+    /// Preserve Grevm's historical skipped-no-op behavior.
+    IncludeNoop,
+}
+
 /// Runtime configuration for one grevm scheduler.
 ///
 /// Environment variables are read once when [`Self::from_env`] is called. Callers that need
@@ -13,6 +25,8 @@ pub struct GrevmConfig {
     pub force_sequential: bool,
     /// Blocks smaller than this threshold use the sequential path.
     pub min_parallel_txs: usize,
+    /// Handling for invalid transactions found during sequential replay.
+    pub invalid_transaction_policy: InvalidTransactionPolicy,
     /// EIP-7702 delegated-account safety policy.
     pub delegated_safety: DelegatedSafetyConfig,
 }
@@ -25,6 +39,7 @@ impl GrevmConfig {
             concurrency_level: env_or("GREVM_CONCURRENT_LEVEL", defaults.concurrency_level),
             force_sequential: env_or("GREVM_FALLBACK_SEQUENTIAL", defaults.force_sequential),
             min_parallel_txs: env_or("GREVM_MIN_PARALLEL_TXS", defaults.min_parallel_txs),
+            invalid_transaction_policy: defaults.invalid_transaction_policy,
             delegated_safety: defaults.delegated_safety,
         }
     }
@@ -32,6 +47,15 @@ impl GrevmConfig {
     /// Overrides the delegated-account policy while preserving all execution settings.
     pub fn with_delegated_safety(mut self, delegated_safety: DelegatedSafetyConfig) -> Self {
         self.delegated_safety = delegated_safety;
+        self
+    }
+
+    /// Overrides invalid-transaction handling while preserving execution settings.
+    pub const fn with_invalid_transaction_policy(
+        mut self,
+        policy: InvalidTransactionPolicy,
+    ) -> Self {
+        self.invalid_transaction_policy = policy;
         self
     }
 }
@@ -42,6 +66,7 @@ impl Default for GrevmConfig {
             concurrency_level: std::thread::available_parallelism().map_or(8, |value| value.get()),
             force_sequential: false,
             min_parallel_txs: 64,
+            invalid_transaction_policy: InvalidTransactionPolicy::Abort,
             delegated_safety: DelegatedSafetyConfig::default(),
         }
     }
@@ -63,6 +88,7 @@ mod tests {
         let config = GrevmConfig::default();
         assert!(config.concurrency_level > 0);
         assert_eq!(config.min_parallel_txs, 64);
+        assert_eq!(config.invalid_transaction_policy, InvalidTransactionPolicy::Abort);
         assert!(!config.force_sequential);
         assert!(!config.delegated_safety.forbid_delegated_create);
         assert!(!config.delegated_safety.reserve_delegated_balance);
@@ -74,6 +100,7 @@ mod tests {
             concurrency_level: 3,
             force_sequential: true,
             min_parallel_txs: 7,
+            invalid_transaction_policy: InvalidTransactionPolicy::IncludeNoop,
             delegated_safety: DelegatedSafetyConfig::default(),
         }
         .with_delegated_safety(DelegatedSafetyConfig::enabled());

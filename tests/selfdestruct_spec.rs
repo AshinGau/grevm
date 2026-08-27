@@ -505,7 +505,7 @@ fn beneficiary_actual_selfdestruct_dominates_the_transaction_reward() {
 }
 
 #[test]
-fn cancun_created_beneficiary_actual_selfdestruct_dominates_reward() {
+fn created_beneficiary_selfdestruct_obeys_delayed_clear_rules() {
     // Put Amsterdam first so a failure cannot be hidden behind an earlier fork: EIP-7708 also
     // makes the reward/deletion ordering observable in the transaction logs.
     for spec in [SpecId::AMSTERDAM, SpecId::CANCUN, SpecId::PRAGUE] {
@@ -525,9 +525,24 @@ fn cancun_created_beneficiary_actual_selfdestruct_dominates_reward() {
             txs,
             beneficiary,
         );
-        assert!(
-            bundle.state.get(&beneficiary).is_none_or(|account| account.info.is_none()),
-            "{spec:?}: actual SELFDESTRUCT must dominate deferred beneficiary reward"
-        );
+        if spec == SpecId::AMSTERDAM {
+            // EIP-8246 delays the clear until the end of the transaction and preserves an account
+            // that receives a non-zero beneficiary reward. Its executable state is still cleared.
+            let account = bundle
+                .state
+                .get(&beneficiary)
+                .expect("the rewarded beneficiary must remain as a balance-only account");
+            let info = account.info.as_ref().expect("the reward must materialize the account");
+            assert!(!info.balance.is_zero());
+            assert_eq!(info.nonce, 0);
+            assert_eq!(info.code_hash, KECCAK_EMPTY);
+            assert!(account.storage.is_empty());
+            assert!(!account.was_destroyed());
+        } else {
+            assert!(
+                bundle.state.get(&beneficiary).is_none_or(|account| account.info.is_none()),
+                "{spec:?}: actual SELFDESTRUCT must dominate deferred beneficiary reward"
+            );
+        }
     }
 }

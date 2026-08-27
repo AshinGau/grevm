@@ -3,8 +3,8 @@
 //! End-to-end tests for capability-restricted custom precompiles.
 
 use grevm::{
-    DelegatedSafetyConfig, DynParallelPrecompile, GrevmConfig, InvalidTransaction, ParallelState,
-    ParallelTakeBundle, Scheduler, TxExecutionOutcome,
+    DelegatedSafetyConfig, DynParallelPrecompile, GrevmConfig, InvalidTransaction,
+    InvalidTransactionPolicy, ParallelState, ParallelTakeBundle, Scheduler, TxExecutionOutcome,
     test_utils::common::{account, execute, storage::InMemoryDB},
 };
 use revm::precompile::{PrecompileError, PrecompileHalt, PrecompileId, PrecompileOutput};
@@ -218,6 +218,7 @@ fn execute_block(
             concurrency_level: 2,
             force_sequential,
             min_parallel_txs: 0,
+            invalid_transaction_policy: InvalidTransactionPolicy::IncludeNoop,
             delegated_safety: DelegatedSafetyConfig::disabled(),
         },
     );
@@ -742,6 +743,7 @@ fn fatal_precompile_discards_its_parallel_incarnation_writes() {
             concurrency_level: 2,
             force_sequential: false,
             min_parallel_txs: 0,
+            invalid_transaction_policy: Default::default(),
             delegated_safety: DelegatedSafetyConfig::disabled(),
         },
     );

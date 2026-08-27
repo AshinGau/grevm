@@ -388,6 +388,7 @@ fn execution_metrics_are_reported_once_for_sequential_and_error_paths() {
             concurrency_level: 1,
             force_sequential: true,
             min_parallel_txs: 0,
+            invalid_transaction_policy: Default::default(),
             delegated_safety: DelegatedSafetyConfig::default(),
         },
     );
@@ -415,6 +416,7 @@ fn execution_metrics_are_reported_once_for_sequential_and_error_paths() {
             concurrency_level: 1,
             force_sequential: false,
             min_parallel_txs: 0,
+            invalid_transaction_policy: Default::default(),
             delegated_safety: DelegatedSafetyConfig::default(),
         },
     );
@@ -592,6 +594,7 @@ fn precompile_reads_are_incarnation_stable_and_conflicts_retry() {
             concurrency_level: 2,
             force_sequential: false,
             min_parallel_txs: 0,
+            invalid_transaction_policy: Default::default(),
             delegated_safety: DelegatedSafetyConfig::disabled(),
         },
     );
