@@ -92,11 +92,19 @@ where
                 let output =
                     GrevmHandler::new(reserve_mode, BeneficiaryMode::Immediate).run(&mut evm);
                 let state = evm.finalize();
-                output.map(|output| {
-                    let result = output.into_immediate_result();
-                    evm.db_mut().commit(state);
-                    result
-                })
+                match output {
+                    Ok(output) => {
+                        let result = output.into_immediate_result();
+                        evm.db_mut().commit(state);
+                        evm.db_mut().bump_bal_index();
+                        Ok(result)
+                    }
+                    Err(EVMError::Transaction(error)) => {
+                        evm.db_mut().bump_bal_index();
+                        Err(EVMError::Transaction(error))
+                    }
+                    Err(error) => Err(error),
+                }
             })
         };
         let SequentialReplayOutput { outcomes, error } = replay;

@@ -1,15 +1,16 @@
 use core::hash::{BuildHasherDefault, Hasher};
 use dashmap::{DashMap, Entry, mapref::one::RefMut};
 use metrics::histogram;
-use revm::{Database, DatabaseCommit, DatabaseRef};
+use revm::{Database, DatabaseCommit, DatabaseRef, database_interface::bal::BalState};
 use revm_database::{
-    AccountStatus, BundleState, CacheState, PlainAccount, StorageWithOriginalValues,
-    TransitionAccount, TransitionState,
+    AccountStatus, BundleState, CacheState, DatabaseCommitExt, PlainAccount,
+    StorageWithOriginalValues, TransitionAccount, TransitionState,
     states::{CacheAccount, bundle_state::BundleRetention, plain_account::PlainStorage},
 };
 use revm_primitives::{Address, B256, U256};
 use revm_state::{
     Account, AccountInfo, Bytecode, EvmState, EvmStorage, EvmStorageSlot, TransactionId,
+    bal::{BlockAccessIndex, alloy::AlloyBal},
 };
 use std::{
     borrow::Cow,
@@ -49,6 +50,19 @@ fn add_transitions(
         });
         (address, transition)
     }));
+}
+
+fn commit_canonical_state(
+    cache: &ParallelCacheState,
+    transition_state: &mut Option<TransitionState>,
+    bal_state: &mut BalState,
+    evm_state: EvmState,
+) {
+    bal_state.commit(&evm_state);
+    let transitions = cache.apply_evm_state_inner(evm_state);
+    if let Some(state) = transition_state {
+        add_transitions(state, transitions);
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -467,6 +481,8 @@ pub struct ParallelState<DB> {
     /// This map can be used to give different values for block hashes if in case
     /// The fork block is different or some blocks are not saved inside database.
     pub block_hashes: DashMap<u64, B256, BuildIdentityHasher>,
+    /// EIP-7928 state mutated only by canonical, block-ordered commits.
+    bal_state: BalState,
     update_db_metrics: bool,
     db_latency: metrics::Histogram,
 }
@@ -533,23 +549,6 @@ impl<'a, DB: DatabaseRef> ParallelStateView<'a, DB> {
             Entry::Vacant(entry) => Ok(entry.insert(account)),
             Entry::Occupied(entry) => Ok(entry.into_ref()),
         }
-    }
-
-    fn increment_balance_transitions(
-        self,
-        balances: impl IntoIterator<Item = (Address, u128)>,
-    ) -> Result<Vec<(Address, TransitionAccount)>, DB::Error> {
-        let mut transitions = Vec::new();
-        for (address, balance) in balances {
-            if balance == 0 {
-                continue;
-            }
-            let mut account = self.load_mut_cache_account(address)?;
-            let transition =
-                account.increment_balance(balance).expect("balance was checked as non-zero");
-            transitions.push((address, transition));
-        }
-        Ok(transitions)
     }
 
     fn db_basic(self, address: Address) -> Result<Option<AccountInfo>, DB::Error> {
@@ -653,6 +652,13 @@ impl<DB: DatabaseRef> DatabaseRef for ParallelStateView<'_, DB> {
 pub(crate) struct ParallelStateCommit<'a, DB> {
     shared: ParallelStateView<'a, DB>,
     transition_state: &'a mut Option<TransitionState>,
+    bal_state: &'a mut BalState,
+}
+
+impl<DB> ParallelStateCommit<'_, DB> {
+    pub(crate) const fn bump_bal_index(&mut self) {
+        self.bal_state.bump_bal_index();
+    }
 }
 
 impl<DB: DatabaseRef> DatabaseRef for ParallelStateCommit<'_, DB> {
@@ -677,10 +683,7 @@ impl<DB: DatabaseRef> DatabaseRef for ParallelStateCommit<'_, DB> {
 
 impl<DB: DatabaseRef> DatabaseCommit for ParallelStateCommit<'_, DB> {
     fn commit(&mut self, evm_state: EvmState) {
-        let transitions = self.shared.cache.apply_evm_state_inner(evm_state);
-        if let Some(state) = self.transition_state.as_mut() {
-            add_transitions(state, transitions);
-        }
+        commit_canonical_state(self.shared.cache, self.transition_state, self.bal_state, evm_state);
     }
 }
 
@@ -706,6 +709,7 @@ impl<DB: DatabaseRef> ParallelState<DB> {
             transition_state: with_bundle_update.then(TransitionState::default),
             bundle_state: BundleState::default(),
             block_hashes: DashMap::default(),
+            bal_state: BalState::default(),
             update_db_metrics,
             db_latency: histogram!("grevm.db_latency_us"),
         }
@@ -732,6 +736,7 @@ impl<DB: DatabaseRef> ParallelState<DB> {
             transition_state,
             bundle_state: _,
             block_hashes,
+            bal_state,
             update_db_metrics,
             db_latency,
         } = self;
@@ -742,7 +747,33 @@ impl<DB: DatabaseRef> ParallelState<DB> {
             update_db_metrics: *update_db_metrics,
             db_latency,
         };
-        (shared, ParallelStateCommit { shared, transition_state })
+        (shared, ParallelStateCommit { shared, transition_state, bal_state })
+    }
+
+    /// Enable EIP-7928 block access list construction.
+    pub fn with_bal_builder(mut self) -> Self {
+        self.bal_state = core::mem::take(&mut self.bal_state).with_bal_builder();
+        self
+    }
+
+    /// Enable EIP-7928 block access list construction when `enabled` is true.
+    pub fn with_bal_builder_if(self, enabled: bool) -> Self {
+        if enabled { self.with_bal_builder() } else { self }
+    }
+
+    /// Advance the index used by the next canonical commit.
+    pub const fn bump_bal_index(&mut self) {
+        self.bal_state.bump_bal_index();
+    }
+
+    /// Return the index used by the next canonical commit.
+    pub const fn bal_index(&self) -> BlockAccessIndex {
+        self.bal_state.bal_index()
+    }
+
+    /// Take the constructed EIP-7928 block access list.
+    pub fn take_built_alloy_bal(&mut self) -> Option<AlloyBal> {
+        self.bal_state.take_built_alloy_bal()
     }
 
     /// Returns the size hint for the inner bundle state.
@@ -763,9 +794,7 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         &mut self,
         balances: impl IntoIterator<Item = (Address, u128)>,
     ) -> Result<(), DB::Error> {
-        let transitions = self.shared_view().increment_balance_transitions(balances)?;
-        self.apply_transition(transitions);
-        Ok(())
+        DatabaseCommitExt::increment_balances(self, balances)
     }
 
     /// Drain balances from given account and return those values.
@@ -775,18 +804,7 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         &mut self,
         addresses: impl IntoIterator<Item = Address>,
     ) -> Result<Vec<u128>, DB::Error> {
-        let mut transitions = Vec::new();
-        let mut balances = Vec::new();
-        for address in addresses {
-            let mut original_account = self.load_mut_cache_account(address)?;
-            let (balance, transition) = original_account.drain_balance();
-            balances.push(balance);
-            transitions.push((address, transition))
-        }
-        if let Some(state) = self.transition_state.as_mut() {
-            add_transitions(state, transitions)
-        }
-        Ok(balances)
+        DatabaseCommitExt::drain_balances(self, addresses)
     }
 
     /// Insert non-existent account
@@ -907,17 +925,19 @@ impl<DB: DatabaseRef> DatabaseRef for ParallelState<DB> {
 
 impl<DB: DatabaseRef> DatabaseCommit for ParallelState<DB> {
     fn commit(&mut self, evm_state: EvmState) {
-        let transitions = self.cache.apply_evm_state_inner(evm_state);
-        if let Some(state) = self.transition_state.as_mut() {
-            add_transitions(state, transitions);
-        }
+        commit_canonical_state(
+            &self.cache,
+            &mut self.transition_state,
+            &mut self.bal_state,
+            evm_state,
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use revm_database::{CacheDB, EmptyDB};
+    use revm_database::{CacheDB, EmptyDB, StateBuilder};
 
     #[test]
     fn duration_micros_preserves_sub_microsecond_precision() {
@@ -948,5 +968,25 @@ mod tests {
 
         assert_eq!(state.storage_ref(address, U256::ZERO).unwrap(), U256::ZERO);
         assert!(!state.cache.accounts.contains_key(&address));
+    }
+
+    #[test]
+    fn balance_changes_match_revm_bal() {
+        let address = Address::with_last_byte(2);
+        let info = AccountInfo { balance: U256::from(5), nonce: 1, ..Default::default() };
+        let mut parallel = ParallelState::new(EmptyDB::default(), true, false).with_bal_builder();
+        parallel.insert_account(address, info.clone());
+
+        let mut reference = StateBuilder::new()
+            .with_database(EmptyDB::default())
+            .with_bundle_update()
+            .with_bal_builder()
+            .build();
+        reference.insert_account(address, info);
+
+        parallel.increment_balances([(address, 8)]).unwrap();
+        reference.increment_balances([(address, 8)]).unwrap();
+
+        assert_eq!(parallel.take_built_alloy_bal(), reference.take_built_alloy_bal());
     }
 }

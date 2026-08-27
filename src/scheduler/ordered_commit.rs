@@ -10,7 +10,7 @@ use revm_context::{
     result::{EVMError, ExecutionResult},
 };
 use revm_primitives::Address;
-use revm_state::Account;
+use revm_state::{Account, TransactionId};
 
 use crate::{
     GrevmError, TxExecutionOutcome, TxId, beneficiary::SpeculativeResult,
@@ -150,11 +150,16 @@ where
                 .state
                 .basic_ref(self.beneficiary)
                 .map_err(|error| GrevmError { txid, error: EVMError::Database(error) })?;
-            let mut account = Account::from(reward.apply_to(info));
+            let mut account = match info {
+                Some(info) => Account::from(info),
+                None => Account::new_not_existing(TransactionId::ZERO),
+            };
+            account.info = reward.apply_to(Some(account.info.clone()));
             account.mark_touch();
             let _ = state.insert(self.beneficiary, account);
         }
         self.state.commit(state);
+        self.state.bump_bal_index();
         Ok(CommitOutcome::Committed(output.push(result)))
     }
 }
@@ -169,7 +174,7 @@ mod tests {
         result::{Output, ResultAndState, ResultGas, SuccessReason},
         transaction::{Authorization, RecoveredAuthority, RecoveredAuthorization},
     };
-    use revm_database::EmptyDB;
+    use revm_database::{EmptyDB, StateBuilder};
     use revm_primitives::{Address, B256, Bytes, U256};
     use revm_state::{Account, AccountInfo, AccountStatus, Bytecode};
     use std::fmt::{Display, Formatter};
@@ -284,6 +289,7 @@ mod tests {
             state.basic_ref(caller).expect("state read").expect("caller account").nonce,
             post_nonce
         );
+        assert_eq!(state.bal_index().get(), 1);
     }
 
     fn commit_deferred_reward(
@@ -416,6 +422,28 @@ mod tests {
         assert_eq!(info.balance, U256::MAX);
         assert_eq!(info.nonce, 7);
         assert_eq!(info.code_hash, code_hash);
+    }
+
+    #[test]
+    fn deferred_reward_records_original_balance_in_bal() {
+        let beneficiary = Address::with_last_byte(0xBD);
+        let original = AccountInfo { balance: U256::from(10), nonce: 3, ..Default::default() };
+        let mut parallel = ParallelState::new(EmptyDB::default(), true, false).with_bal_builder();
+        parallel.insert_account(beneficiary, original.clone());
+        commit_deferred_reward(&mut parallel, beneficiary, U256::from(7), 0);
+
+        let mut reference = StateBuilder::new()
+            .with_database(EmptyDB::default())
+            .with_bundle_update()
+            .with_bal_builder()
+            .build();
+        reference.insert_account(beneficiary, original.clone());
+        let mut expected = Account::from(original);
+        expected.info.balance = U256::from(17);
+        expected.mark_touch();
+        reference.commit([(beneficiary, expected)].into_iter().collect());
+
+        assert_eq!(parallel.take_built_alloy_bal(), reference.take_built_alloy_bal());
     }
 
     #[test]
