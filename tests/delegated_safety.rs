@@ -291,6 +291,7 @@ fn execute_block_with_precompiles_and_spec(
         concurrency_level,
         force_sequential,
         min_parallel_txs: 0,
+        invalid_transaction_policy: Default::default(),
         delegated_safety: safety,
     };
     let scheduler = Scheduler::new_with_runtime_config(

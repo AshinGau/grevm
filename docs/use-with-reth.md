@@ -50,8 +50,8 @@ where
     let (results, mut state) = scheduler.take_result_and_state();
     let bundle = state.parallel_take_bundle(BundleRetention::Reverts);
 
-    // `results`: one outcome per transaction, in order. Transaction-validation errors are
-    // returned as `Skipped(InvalidTransaction)` and do not modify state or consume gas.
+    // With the default IncludeNoop policy, transaction-validation errors are returned as
+    // `Skipped(InvalidTransaction)` and do not modify state or consume gas.
     for outcome in &results {
         match outcome {
             TxExecutionOutcome::Executed(result) => {

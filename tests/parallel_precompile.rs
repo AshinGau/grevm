@@ -218,6 +218,7 @@ fn execute_block(
             concurrency_level: 2,
             force_sequential,
             min_parallel_txs: 0,
+            invalid_transaction_policy: Default::default(),
             delegated_safety: DelegatedSafetyConfig::disabled(),
         },
     );
@@ -742,6 +743,7 @@ fn fatal_precompile_discards_its_parallel_incarnation_writes() {
             concurrency_level: 2,
             force_sequential: false,
             min_parallel_txs: 0,
+            invalid_transaction_policy: Default::default(),
             delegated_safety: DelegatedSafetyConfig::disabled(),
         },
     );

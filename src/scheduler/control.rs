@@ -26,7 +26,8 @@ where
     /// # Errors
     ///
     /// Returns an error if this scheduler has already started, or if execution encounters a
-    /// database, fatal EVM, or scheduler invariant error. Invalid transactions are skipped.
+    /// database, fatal EVM, or scheduler invariant error. Invalid transactions follow the
+    /// configured [`crate::InvalidTransactionPolicy`].
     pub fn execute(&self) -> Result<(), GrevmError<DB::Error>> {
         self.parallel_execute(None)
     }
@@ -39,7 +40,8 @@ where
     /// # Errors
     ///
     /// Returns an error if this scheduler has already started, or if execution encounters a
-    /// database, fatal EVM, or scheduler invariant error. Invalid transactions are skipped.
+    /// database, fatal EVM, or scheduler invariant error. Invalid transactions follow the
+    /// configured [`crate::InvalidTransactionPolicy`].
     ///
     /// # Panics
     ///

@@ -37,7 +37,7 @@ pub(crate) use model::{
 };
 
 pub use bundle::{ParallelBundleState, ParallelTakeBundle};
-pub use config::GrevmConfig;
+pub use config::{GrevmConfig, InvalidTransactionPolicy};
 pub use delegated_safety::DelegatedSafetyConfig;
 pub use outcome::{GrevmError, TxExecutionOutcome};
 pub use parallel_state::{ParallelCacheState, ParallelState};
