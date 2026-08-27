@@ -4,7 +4,7 @@
 
 ```toml
 [dependencies]
-grevm = { git = "https://github.com/AshinGau/grevm.git", rev = "<immutable-commit>" }
+grevm = { git = "https://github.com/Galxe/grevm.git", branch = "main" }
 ```
 
 ## Standalone usage
@@ -118,7 +118,7 @@ impl<DB: DatabaseRef> ParallelTakeBundle for ParallelState<DB> {
 ```
 
 Public items re-exported from the crate root include `Scheduler`, `GrevmConfig`,
-`InvalidTransactionPolicy`,
+`InvalidTransactionPolicy`, `LockedDatabase`,
 `DelegatedSafetyConfig`, `ParallelState`, `ParallelCacheState`, `TxExecutionOutcome`,
 `InvalidTransaction`, `GrevmError`, `ParallelPrecompile`, `DynParallelPrecompile`,
 `ParallelPrecompileInput`, `ParallelPrecompileState`, `ParallelPrecompileResult`, and
