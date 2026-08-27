@@ -51,8 +51,8 @@ where
     let (results, mut state) = scheduler.take_result_and_state();
     let bundle = state.parallel_take_bundle(BundleRetention::Reverts);
 
-    // With the default IncludeNoop policy, transaction-validation errors are returned as
-    // `Skipped(InvalidTransaction)` and do not modify state or consume gas.
+    // Abort is the safe default for fixed blocks. Builder integrations can select Omit and inspect
+    // `Skipped(InvalidTransaction)` outcomes before assembling the retained transaction list.
     for outcome in &results {
         match outcome {
             TxExecutionOutcome::Executed(result) => {

@@ -750,7 +750,7 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         (shared, ParallelStateCommit { shared, transition_state, bal_state })
     }
 
-    /// Enable EIP-7928 block access list construction.
+    /// Enable EIP-7928 block access list construction at the pre-execution index (`0`).
     pub fn with_bal_builder(mut self) -> Self {
         self.bal_state = core::mem::take(&mut self.bal_state).with_bal_builder();
         self
@@ -761,8 +761,16 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         if enabled { self.with_bal_builder() } else { self }
     }
 
-    /// Advance the index used by the next canonical commit.
-    pub const fn bump_bal_index(&mut self) {
+    /// Advance from EIP-7928 pre-execution index `0` to transaction index `1`.
+    ///
+    /// Call this exactly once after pre-execution changes and before handing the state to a
+    /// [`crate::Scheduler`]. The scheduler advances the index after every retained transaction, so
+    /// the returned state is already positioned at the post-execution index.
+    pub const fn begin_bal_transactions(&mut self) {
+        self.bal_state.bump_bal_index();
+    }
+
+    pub(crate) const fn bump_bal_index(&mut self) {
         self.bal_state.bump_bal_index();
     }
 
@@ -794,7 +802,12 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         &mut self,
         balances: impl IntoIterator<Item = (Address, u128)>,
     ) -> Result<(), DB::Error> {
-        DatabaseCommitExt::increment_balances(self, balances)
+        for (address, balance) in balances {
+            if balance != 0 {
+                DatabaseCommitExt::increment_balances(self, [(address, balance)])?;
+            }
+        }
+        Ok(())
     }
 
     /// Drain balances from given account and return those values.
@@ -804,7 +817,11 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         &mut self,
         addresses: impl IntoIterator<Item = Address>,
     ) -> Result<Vec<u128>, DB::Error> {
-        DatabaseCommitExt::drain_balances(self, addresses)
+        let mut balances = Vec::new();
+        for address in addresses {
+            balances.extend(DatabaseCommitExt::drain_balances(self, [address])?);
+        }
+        Ok(balances)
     }
 
     /// Insert non-existent account
@@ -971,7 +988,7 @@ mod tests {
     }
 
     #[test]
-    fn balance_changes_match_revm_bal() {
+    fn repeated_balance_changes_match_revm_state_and_bal() {
         let address = Address::with_last_byte(2);
         let info = AccountInfo { balance: U256::from(5), nonce: 1, ..Default::default() };
         let mut parallel = ParallelState::new(EmptyDB::default(), true, false).with_bal_builder();
@@ -983,9 +1000,17 @@ mod tests {
             .with_bal_builder()
             .build();
         reference.insert_account(address, info);
+        parallel.begin_bal_transactions();
+        reference.bump_bal_index();
 
-        parallel.increment_balances([(address, 8)]).unwrap();
+        parallel.increment_balances([(address, 8), (address, 3), (address, 0)]).unwrap();
         reference.increment_balances([(address, 8)]).unwrap();
+        reference.increment_balances([(address, 3)]).unwrap();
+
+        assert_eq!(parallel.basic_ref(address).unwrap().unwrap().balance, U256::from(16));
+        assert_eq!(parallel.drain_balances([address, address]).unwrap(), [16, 0]);
+        assert_eq!(reference.drain_balances([address]).unwrap(), [16]);
+        assert_eq!(reference.drain_balances([address]).unwrap(), [0]);
 
         assert_eq!(parallel.take_built_alloy_bal(), reference.take_built_alloy_bal());
     }

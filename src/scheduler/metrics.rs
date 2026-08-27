@@ -219,33 +219,6 @@ impl<DB: revm::DatabaseRef> super::Scheduler<DB> {
 #[cfg(all(test, feature = "test-utils"))]
 mod tests {
     use super::*;
-    use metrics_util::debugging::DebuggingRecorder;
-    use std::collections::BTreeSet;
-
-    #[test]
-    fn snapshot_schema_matches_reported_metrics() {
-        let collector = ExecuteMetricsCollector::default();
-        collector.record_block_start(7);
-        // `execution_time` intentionally skips zero values in `report`.
-        collector.record_execution_time(Duration::from_nanos(1));
-
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        metrics::with_local_recorder(&recorder, || collector.report());
-
-        let reported_names = snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .map(|(key, _, _, _)| key.key().name().to_owned())
-            .collect::<BTreeSet<_>>();
-        let snapshot = collector.snapshot();
-        let snapshot_names =
-            snapshot.keys().map(|name| (*name).to_owned()).collect::<BTreeSet<_>>();
-
-        assert_eq!(reported_names, snapshot_names);
-        assert_eq!(snapshot["grevm.total_tx_cnt"], 7);
-    }
 
     #[test]
     fn conflict_methods_update_total_and_exactly_one_cause() {

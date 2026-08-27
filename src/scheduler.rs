@@ -172,7 +172,9 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if [`GrevmConfig::concurrency_level`] is zero.
+    /// Panics if [`GrevmConfig::concurrency_level`] is zero, or if omitted transactions are
+    /// combined with delegated-balance reservation. Reservation considers the original transaction
+    /// list, so removing an invalid transaction could otherwise change an earlier result.
     pub fn new_with_runtime_config(
         cfg: CfgEnv,
         env: BlockEnv,
@@ -197,6 +199,11 @@ where
         // The configuration may be shared across historical and current blocks. EIP-7702 safety
         // policies become effective only once the selected EVM spec activates Prague.
         config.delegated_safety = config.delegated_safety.for_spec(cfg.spec);
+        assert!(
+            config.invalid_transaction_policy != crate::InvalidTransactionPolicy::Omit ||
+                !config.delegated_safety.reserve_delegated_balance,
+            "omitting invalid transactions is incompatible with delegated-balance reservation"
+        );
         // Reserve-planner construction is O(1): sender indexing and per-account maximum-cost
         // suffixes remain lazy until surviving delegated execution actually debits an account.
         let reserve_planner = config

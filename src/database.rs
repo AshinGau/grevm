@@ -17,6 +17,11 @@ impl<DB> LockedDatabase<DB> {
     pub const fn new(database: DB) -> Self {
         Self(Mutex::new(database))
     }
+
+    /// Consumes the adapter and returns the underlying database.
+    pub fn into_inner(self) -> DB {
+        self.0.into_inner()
+    }
 }
 
 impl<DB> fmt::Debug for LockedDatabase<DB> {

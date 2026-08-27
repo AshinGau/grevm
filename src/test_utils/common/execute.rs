@@ -2,8 +2,8 @@ use alloy_evm::{EthEvm, Evm, precompiles::PrecompilesMap};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 
 use crate::{
-    DelegatedSafetyConfig, GrevmConfig, ParallelState, ParallelTakeBundle, Scheduler,
-    TxExecutionOutcome,
+    DelegatedSafetyConfig, GrevmConfig, InvalidTransactionPolicy, ParallelState,
+    ParallelTakeBundle, Scheduler, TxExecutionOutcome,
 };
 use revm::{
     Context, DatabaseCommit, DatabaseRef, MainBuilder, MainContext, handler::EthPrecompiles,
@@ -183,6 +183,7 @@ where
     let mut runtime_config = revm_compatibility_config();
     // Do not select the sequential path merely because an invalid fixture is small.
     runtime_config.min_parallel_txs = 0;
+    runtime_config.invalid_transaction_policy = InvalidTransactionPolicy::IncludeNoop;
     let scheduler = Scheduler::new_with_runtime_config(cfg, env, txs, state, None, runtime_config);
     scheduler.execute().expect("parallel execute failed");
     let (actual_outcomes, mut state) = scheduler.take_result_and_state();

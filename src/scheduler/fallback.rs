@@ -189,7 +189,7 @@ fn reject_nonce_overflow<DB: DatabaseRef>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GrevmConfig, ParallelState};
+    use crate::{DelegatedSafetyConfig, GrevmConfig, ParallelState};
     use revm_context::{
         BlockEnv, CfgEnv,
         result::{Output, ResultGas, SuccessReason},
@@ -208,12 +208,14 @@ mod tests {
     }
 
     fn scheduler(num_txs: usize) -> Scheduler<EmptyDB> {
-        Scheduler::new(
+        Scheduler::new_with_runtime_config(
             CfgEnv::new_with_spec(SpecId::SHANGHAI),
             BlockEnv::default(),
             Arc::new(vec![TxEnv::default(); num_txs]),
             ParallelState::new(EmptyDB::default(), true, false),
             None,
+            GrevmConfig::default()
+                .with_invalid_transaction_policy(InvalidTransactionPolicy::IncludeNoop),
         )
     }
 
@@ -271,5 +273,22 @@ mod tests {
         let include = scheduler_with_policy(InvalidTransactionPolicy::IncludeNoop);
         include.fallback_sequential().unwrap();
         assert_eq!(include.take_result_and_state().1.bal_index().get(), 1);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "omitting invalid transactions is incompatible with delegated-balance reservation"
+    )]
+    fn omit_rejects_delegated_balance_reservation() {
+        let _ = Scheduler::new_with_runtime_config(
+            CfgEnv::new_with_spec(SpecId::PRAGUE),
+            BlockEnv::default(),
+            Arc::new(Vec::new()),
+            ParallelState::new(EmptyDB::default(), true, false),
+            None,
+            GrevmConfig::default()
+                .with_invalid_transaction_policy(InvalidTransactionPolicy::Omit)
+                .with_delegated_safety(DelegatedSafetyConfig::enabled()),
+        );
     }
 }

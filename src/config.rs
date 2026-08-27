@@ -4,11 +4,11 @@ use crate::DelegatedSafetyConfig;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum InvalidTransactionPolicy {
     /// Return the invalid transaction as an execution error.
+    #[default]
     Abort,
     /// Return a skipped outcome without reserving a block position.
     Omit,
     /// Preserve Grevm's historical skipped-no-op behavior.
-    #[default]
     IncludeNoop,
 }
 
@@ -66,7 +66,7 @@ impl Default for GrevmConfig {
             concurrency_level: std::thread::available_parallelism().map_or(8, |value| value.get()),
             force_sequential: false,
             min_parallel_txs: 64,
-            invalid_transaction_policy: InvalidTransactionPolicy::IncludeNoop,
+            invalid_transaction_policy: InvalidTransactionPolicy::Abort,
             delegated_safety: DelegatedSafetyConfig::default(),
         }
     }
@@ -88,7 +88,7 @@ mod tests {
         let config = GrevmConfig::default();
         assert!(config.concurrency_level > 0);
         assert_eq!(config.min_parallel_txs, 64);
-        assert_eq!(config.invalid_transaction_policy, InvalidTransactionPolicy::IncludeNoop);
+        assert_eq!(config.invalid_transaction_policy, InvalidTransactionPolicy::Abort);
         assert!(!config.force_sequential);
         assert!(!config.delegated_safety.forbid_delegated_create);
         assert!(!config.delegated_safety.reserve_delegated_balance);

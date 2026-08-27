@@ -3,8 +3,8 @@
 //! End-to-end tests for grevm's opt-in EIP-7702 delegated-account safety policy.
 
 use grevm::{
-    DelegatedSafetyConfig, DynParallelPrecompile, GrevmConfig, InvalidTransaction, ParallelState,
-    ParallelTakeBundle, Scheduler, TxExecutionOutcome,
+    DelegatedSafetyConfig, DynParallelPrecompile, GrevmConfig, InvalidTransaction,
+    InvalidTransactionPolicy, ParallelState, ParallelTakeBundle, Scheduler, TxExecutionOutcome,
     test_utils::{
         TRANSFER_GAS_LIMIT,
         common::{account, execute, storage::InMemoryDB},
@@ -291,7 +291,7 @@ fn execute_block_with_precompiles_and_spec(
         concurrency_level,
         force_sequential,
         min_parallel_txs: 0,
-        invalid_transaction_policy: Default::default(),
+        invalid_transaction_policy: InvalidTransactionPolicy::IncludeNoop,
         delegated_safety: safety,
     };
     let scheduler = Scheduler::new_with_runtime_config(

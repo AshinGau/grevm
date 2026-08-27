@@ -25,7 +25,7 @@ See [Use Grevm with reth](docs/use-with-reth.md) for the public API and integrat
 `GrevmConfig::concurrency_level` controls the number of speculative workers. The finality and
 ordered-commit loops are additional coordinator threads.
 `InvalidTransactionPolicy` supports strict execution (`Abort`), builder filtering (`Omit`), and
-the backward-compatible skipped no-op behavior (`IncludeNoop`, the default).
+the backward-compatible skipped no-op behavior (`IncludeNoop`). Strict execution is the default.
 
 ## Historical Grevm 2.1 highlights
 
