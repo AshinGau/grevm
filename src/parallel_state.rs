@@ -3,8 +3,8 @@ use dashmap::{DashMap, Entry, mapref::one::RefMut};
 use metrics::histogram;
 use revm::{Database, DatabaseCommit, DatabaseRef, database_interface::bal::BalState};
 use revm_database::{
-    AccountStatus, BundleState, CacheState, DatabaseCommitExt, PlainAccount,
-    StorageWithOriginalValues, TransitionAccount, TransitionState,
+    AccountStatus, BundleState, CacheState, PlainAccount, StorageWithOriginalValues,
+    TransitionAccount, TransitionState,
     states::{CacheAccount, bundle_state::BundleRetention, plain_account::PlainStorage},
 };
 use revm_primitives::{Address, B256, U256};
@@ -795,32 +795,65 @@ impl<DB: DatabaseRef> ParallelState<DB> {
     ///
     /// Update will create transitions for all accounts that are updated.
     ///
-    /// Like [CacheAccount::increment_balance], this assumes that incremented balances are not
-    /// zero, and will not overflow once incremented. If using this to implement withdrawals, zero
-    /// balances must be filtered out before calling this function.
+    /// Zero increments are ignored and repeated addresses are applied in input order. No canonical
+    /// state change is committed if loading any account fails.
     pub fn increment_balances(
         &mut self,
         balances: impl IntoIterator<Item = (Address, u128)>,
     ) -> Result<(), DB::Error> {
+        let mut changes = EvmState::default();
         for (address, balance) in balances {
-            if balance != 0 {
-                DatabaseCommitExt::increment_balances(self, [(address, balance)])?;
+            if balance == 0 {
+                continue;
             }
+
+            if let Some(account) = changes.get_mut(&address) {
+                account.info.balance = account.info.balance.saturating_add(U256::from(balance));
+                continue;
+            }
+
+            let mut account = match self.basic(address)? {
+                Some(info) => Account::from(info),
+                None => Account::new_not_existing(TransactionId::ZERO),
+            };
+            account.info.balance = account.info.balance.saturating_add(U256::from(balance));
+            account.mark_touch();
+            changes.insert(address, account);
         }
+        self.commit(changes);
         Ok(())
     }
 
     /// Drain balances from given account and return those values.
     ///
-    /// It is used for DAO hardfork state change to move values from given accounts.
+    /// It is used for DAO hardfork state change to move values from given accounts. Repeated
+    /// addresses return zero after the first occurrence. No canonical state change is committed if
+    /// loading any account fails.
     pub fn drain_balances(
         &mut self,
         addresses: impl IntoIterator<Item = Address>,
     ) -> Result<Vec<u128>, DB::Error> {
-        let mut balances = Vec::new();
+        let addresses = addresses.into_iter();
+        let (lower, _) = addresses.size_hint();
+        let mut changes = EvmState::default();
+        let mut balances = Vec::with_capacity(lower);
+
         for address in addresses {
-            balances.extend(DatabaseCommitExt::drain_balances(self, [address])?);
+            if let Some(account) = changes.get_mut(&address) {
+                balances.push(core::mem::take(&mut account.info.balance).try_into().unwrap());
+                continue;
+            }
+
+            let mut account = match self.basic(address)? {
+                Some(info) => Account::from(info),
+                None => Account::new_not_existing(TransactionId::ZERO),
+            };
+            balances.push(core::mem::take(&mut account.info.balance).try_into().unwrap());
+            account.mark_touch();
+            changes.insert(address, account);
         }
+
+        self.commit(changes);
         Ok(balances)
     }
 
@@ -954,7 +987,53 @@ impl<DB: DatabaseRef> DatabaseCommit for ParallelState<DB> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use revm_database::{CacheDB, EmptyDB, StateBuilder};
+    use revm_context::DBErrorMarker;
+    use revm_database::{CacheDB, EmptyDB};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct BalanceReadError;
+
+    impl std::fmt::Display for BalanceReadError {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.write_str("balance read error")
+        }
+    }
+
+    impl core::error::Error for BalanceReadError {}
+    impl DBErrorMarker for BalanceReadError {}
+
+    #[derive(Clone, Debug)]
+    struct FailingBalanceDb {
+        readable: Address,
+        failing: Address,
+    }
+
+    impl DatabaseRef for FailingBalanceDb {
+        type Error = BalanceReadError;
+
+        fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            if address == self.failing {
+                return Err(BalanceReadError);
+            }
+            Ok((address == self.readable).then(|| AccountInfo {
+                balance: U256::from(5),
+                nonce: 1,
+                ..Default::default()
+            }))
+        }
+
+        fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
+            Ok(Bytecode::default())
+        }
+
+        fn storage_ref(&self, _address: Address, _index: U256) -> Result<U256, Self::Error> {
+            Ok(U256::ZERO)
+        }
+
+        fn block_hash_ref(&self, _number: u64) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
+    }
 
     #[test]
     fn duration_micros_preserves_sub_microsecond_precision() {
@@ -988,30 +1067,45 @@ mod tests {
     }
 
     #[test]
-    fn repeated_balance_changes_match_revm_state_and_bal() {
+    fn repeated_balance_changes_preserve_sequential_semantics() {
         let address = Address::with_last_byte(2);
         let info = AccountInfo { balance: U256::from(5), nonce: 1, ..Default::default() };
         let mut parallel = ParallelState::new(EmptyDB::default(), true, false).with_bal_builder();
-        parallel.insert_account(address, info.clone());
-
-        let mut reference = StateBuilder::new()
-            .with_database(EmptyDB::default())
-            .with_bundle_update()
-            .with_bal_builder()
-            .build();
-        reference.insert_account(address, info);
+        parallel.insert_account(address, info);
         parallel.begin_bal_transactions();
-        reference.bump_bal_index();
 
         parallel.increment_balances([(address, 8), (address, 3), (address, 0)]).unwrap();
-        reference.increment_balances([(address, 8)]).unwrap();
-        reference.increment_balances([(address, 3)]).unwrap();
-
         assert_eq!(parallel.basic_ref(address).unwrap().unwrap().balance, U256::from(16));
         assert_eq!(parallel.drain_balances([address, address]).unwrap(), [16, 0]);
-        assert_eq!(reference.drain_balances([address]).unwrap(), [16]);
-        assert_eq!(reference.drain_balances([address]).unwrap(), [0]);
+        assert_eq!(parallel.basic_ref(address).unwrap().unwrap().balance, U256::ZERO);
 
-        assert_eq!(parallel.take_built_alloy_bal(), reference.take_built_alloy_bal());
+        let bal = parallel.take_built_alloy_bal().unwrap();
+        assert_eq!(bal.len(), 1);
+        assert_eq!(bal[0].address, address);
+        assert_eq!(bal[0].balance_changes.len(), 1);
+        assert_eq!(bal[0].balance_changes[0].block_access_index, BlockAccessIndex::new(1));
+        assert_eq!(bal[0].balance_changes[0].post_balance, U256::ZERO);
+    }
+
+    #[test]
+    fn balance_changes_are_atomic_on_database_error() {
+        let readable = Address::with_last_byte(1);
+        let failing = Address::with_last_byte(2);
+        let database = FailingBalanceDb { readable, failing };
+
+        let mut increment = ParallelState::new(database.clone(), true, false).with_bal_builder();
+        increment.begin_bal_transactions();
+        assert_eq!(
+            increment.increment_balances([(readable, 1), (failing, 1)]),
+            Err(BalanceReadError)
+        );
+        assert_eq!(increment.basic_ref(readable).unwrap().unwrap().balance, U256::from(5));
+        assert_eq!(increment.take_built_alloy_bal(), Some(AlloyBal::default()));
+
+        let mut drain = ParallelState::new(database, true, false).with_bal_builder();
+        drain.begin_bal_transactions();
+        assert_eq!(drain.drain_balances([readable, failing]), Err(BalanceReadError));
+        assert_eq!(drain.basic_ref(readable).unwrap().unwrap().balance, U256::from(5));
+        assert_eq!(drain.take_built_alloy_bal(), Some(AlloyBal::default()));
     }
 }
