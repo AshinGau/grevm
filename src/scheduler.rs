@@ -80,7 +80,6 @@ where
     custom_precompiles: Arc<Vec<(Address, crate::DynParallelPrecompile)>>,
     config: GrevmConfig,
     reserve_planner: Option<Arc<ReservePlanner>>,
-    cancellation: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 
     started: AtomicBool,
     abort: AtomicBool,
@@ -219,7 +218,6 @@ where
             custom_precompiles: custom_precompiles.unwrap_or_else(|| Arc::new(Vec::new())),
             config,
             reserve_planner,
-            cancellation: None,
             started: AtomicBool::new(false),
             abort: AtomicBool::new(false),
             abort_reason: OnceLock::new(),
@@ -227,21 +225,6 @@ where
             commit_wait: WaitSlot::new(),
             metrics: ExecuteMetricsCollector::default(),
         }
-    }
-
-    /// Install a cooperative cancellation check for this execution.
-    ///
-    /// Scheduler roles poll the check while executing and waiting. Once it returns `true`, the
-    /// scheduler stops without replaying the uncommitted suffix and [`Self::execute`] returns a
-    /// cancellation error. The committed prefix remains available through
-    /// [`Self::take_result_and_state`].
-    #[must_use]
-    pub fn with_cancellation(
-        mut self,
-        cancellation: impl Fn() -> bool + Send + Sync + 'static,
-    ) -> Self {
-        self.cancellation = Some(Arc::new(cancellation));
-        self
     }
 
     /// Advance the exclusive end of the contiguous stable prefix.
@@ -254,7 +237,7 @@ where
         let mut finality_idx = 0;
         let mut lower_ts = 0;
         let dependency_distance = self.metrics.dependency_distance_histogram();
-        while !self.should_abort() && finality_idx < self.block_size {
+        while !self.is_aborted() && finality_idx < self.block_size {
             let previous_finality_idx = finality_idx;
             while let Some((mut tx_state, effective_lower_ts)) =
                 self.lock_finality_candidate(finality_idx, lower_ts)
@@ -289,7 +272,7 @@ where
                 thread::yield_now();
             } else {
                 self.finality_wait.wait_while(STALL_TIMEOUT, || {
-                    !self.should_abort() &&
+                    !self.is_aborted() &&
                         self.lock_finality_candidate(finality_idx, lower_ts).is_none()
                 });
             }
@@ -340,7 +323,7 @@ where
         self.commit_wait.register_current_thread();
         let mut output = OrderedCommitOutput::with_capacity(self.block_size);
         let mut commit_idx = 0;
-        while !self.should_abort() && commit_idx < self.block_size {
+        while !self.is_aborted() && commit_idx < self.block_size {
             let previous_commit_idx = commit_idx;
             while commit_idx < self.scheduler_ctx.finality_idx() {
                 let Some(tx_result) = self.tx_results[commit_idx].lock().take() else {
@@ -390,7 +373,7 @@ where
                 thread::yield_now();
             } else {
                 self.commit_wait.wait_while(STALL_TIMEOUT, || {
-                    !self.should_abort() && commit_idx >= self.scheduler_ctx.finality_idx()
+                    !self.is_aborted() && commit_idx >= self.scheduler_ctx.finality_idx()
                 });
             }
         }
@@ -534,7 +517,7 @@ where
                 Task::Execution(version) => self.execute_task(executor, beneficiary, version),
                 Task::Validation(version) => self.validate(beneficiary, version),
             };
-            if task.is_none() && !self.should_abort() {
+            if task.is_none() && !self.is_aborted() {
                 task = self.next();
             }
         }
@@ -850,7 +833,7 @@ where
     }
 
     fn next(&self) -> Option<Task> {
-        while !self.scheduler_ctx.finished() && !self.should_abort() {
+        while !self.scheduler_ctx.finished() && !self.is_aborted() {
             if !self.scheduler_ctx.should_schedule(self.tx_dependency.index()) {
                 thread::yield_now();
             }

@@ -122,5 +122,4 @@ pub(crate) enum AbortReason<DBError> {
     CommitError(GrevmError<DBError>),
     ParallelError { txid: TxId, message: &'static str },
     FallbackSequential,
-    Cancelled,
 }

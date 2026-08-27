@@ -1,8 +1,6 @@
 use revm_context::result::{EVMError, ExecutionResult, InvalidTransaction};
 use std::fmt;
 
-const EXECUTION_CANCELLED: &str = "execution cancelled";
-
 /// Final outcome for one transaction in block order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxExecutionOutcome {
@@ -22,17 +20,6 @@ pub struct GrevmError<DBError> {
     pub txid: usize,
     /// Underlying EVM error.
     pub error: EVMError<DBError>,
-}
-
-impl<DBError> GrevmError<DBError> {
-    pub(crate) fn cancelled(txid: usize) -> Self {
-        Self { txid, error: EVMError::Custom(EXECUTION_CANCELLED.to_owned()) }
-    }
-
-    /// Returns `true` when execution stopped through the installed cancellation check.
-    pub fn is_cancelled(&self) -> bool {
-        matches!(&self.error, EVMError::Custom(message) if message == EXECUTION_CANCELLED)
-    }
 }
 
 impl<DBError: fmt::Display> fmt::Display for GrevmError<DBError> {

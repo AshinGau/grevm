@@ -125,14 +125,6 @@ where
     ) -> SequentialReplayOutput<DB::Error> {
         let mut outcomes = Vec::with_capacity(self.block_size - start);
         for txid in start..self.block_size {
-            // Internal abort reasons are what route execution into this recovery loop. Only an
-            // external cancellation should interrupt suffix replay.
-            if self.poll_cancellation() {
-                return SequentialReplayOutput {
-                    outcomes,
-                    error: Some(GrevmError::cancelled(txid)),
-                };
-            }
             let outcome = match transact(txid, &self.txs[txid]) {
                 Ok(result) => TxExecutionOutcome::Executed(result),
                 Err(EVMError::Transaction(error))

@@ -12,10 +12,7 @@ use revm_primitives::{B256, Bytes, TxKind, U256, hardfork::SpecId};
 use revm_state::{AccountInfo, Bytecode};
 use std::{
     fmt::{Display, Formatter},
-    sync::{
-        Arc as StdArc, Barrier,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Barrier,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,34 +125,6 @@ fn scheduler_returns_an_error_for_a_second_execution() {
         error.error,
         EVMError::Custom(message) if message.contains("can execute only once")
     ));
-}
-
-#[test]
-fn cancellation_is_distinguishable_in_parallel_and_sequential_modes() {
-    for force_sequential in [false, true] {
-        let cancelled = StdArc::new(AtomicBool::new(true));
-        let cancellation = cancelled.clone();
-        let scheduler = Scheduler::new_with_runtime_config(
-            CfgEnv::new_with_spec(SpecId::SHANGHAI),
-            BlockEnv::default(),
-            Arc::new(vec![TxEnv::default()]),
-            ParallelState::new(EmptyDB::default(), true, false),
-            None,
-            GrevmConfig {
-                concurrency_level: 1,
-                force_sequential,
-                min_parallel_txs: 0,
-                invalid_transaction_policy: InvalidTransactionPolicy::IncludeNoop,
-                delegated_safety: DelegatedSafetyConfig::default(),
-            },
-        )
-        .with_cancellation(move || cancellation.load(Ordering::Relaxed));
-
-        let error = scheduler.execute().expect_err("cancelled execution must stop");
-        assert!(error.is_cancelled());
-        let (outcomes, _) = scheduler.take_result_and_state();
-        assert!(outcomes.is_empty());
-    }
 }
 
 #[test]
