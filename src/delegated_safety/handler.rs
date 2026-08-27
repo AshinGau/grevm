@@ -6,9 +6,9 @@ use crate::{
 use metrics::counter;
 use revm::{
     context_interface::journaled_state::account::JournaledAccountTr,
-    handler::{EvmTr, EvmTrError, FrameResult, FrameTr, Handler, post_execution},
+    handler::{EvmTr, EvmTrError, FrameResult, FrameTr, Handler, execution, post_execution},
     interpreter::{
-        CallOutcome, InitialAndFloorGas, InstructionResult, InterpreterResult,
+        CallOutcome, GasTracker, InitialAndFloorGas, InstructionResult, InterpreterResult,
         interpreter_action::FrameInit,
     },
 };
@@ -76,17 +76,17 @@ impl<'a> ReserveMode<'a> {
 /// `ReserveMode::NoReserve` dispatches to a handler that overrides only beneficiary handling, so
 /// validation, pre-execution, execution, and post-execution ordering come directly from revm's
 /// default `Handler` implementation. `ReserveMode::WithReserve` dispatches to a handler that also
-/// overrides `pre_execution` to insert the reserve checkpoint.
+/// overrides `execution` to insert the reserve checkpoint after the authorization and runtime-code
+/// phases.
 ///
 /// The handler deliberately relies on revm's native journal entries and checkpoints. Internal
 /// frame reverts have already removed their entries when `has_reserve_violation` runs, so no
 /// second undo stack or balance-mutation wrapper is needed.
 ///
-/// When reserve protection is enabled, `pre_execution` creates a checkpoint after revm has
-/// deducted gas, bumped a CALL sender's nonce, and applied EIP-7702 authorizations. Revm's default
-/// lifecycle then executes the transaction. This handler reproduces revm's post-execution
-/// ordering, inserts the reserve check after caller reimbursement, and applies the configured
-/// beneficiary policy:
+/// When reserve protection is enabled, `execution` creates a checkpoint after revm has deducted
+/// gas, bumped a CALL sender's nonce, applied EIP-7702 authorizations, and completed the EIP-2780
+/// runtime-code phase. This handler reproduces revm's post-execution ordering, inserts the reserve
+/// check after caller reimbursement, and applies the configured beneficiary policy:
 ///
 /// ```text
 /// validate -> deduct gas / bump CALL nonce -> apply EIP-7702 authorizations
@@ -203,8 +203,8 @@ struct WithReserveHandler<'a, EVM, ERROR, FRAME> {
     planner: &'a ReservePlanner,
     beneficiary_mode: BeneficiaryMode,
     deferred_reward: Cell<Option<DeferredBeneficiaryReward>>,
-    /// Transaction-execution checkpoint created by `pre_execution` and consumed exactly once by
-    /// `reward_beneficiary`. `Cell` is needed because revm exposes both hooks through `&self`.
+    /// Transaction-execution checkpoint created by `execution` and consumed exactly once by
+    /// `post_execution`. `Cell` is needed because revm exposes the latter hook through `&self`.
     execution_checkpoint: Cell<Option<JournalCheckpoint>>,
     _phantom: core::marker::PhantomData<(EVM, ERROR, FRAME)>,
 }
@@ -239,22 +239,27 @@ where
     type Error = ERROR;
     type HaltReason = HaltReason;
 
-    fn pre_execution(
-        &self,
+    fn execution(
+        &mut self,
         evm: &mut Self::Evm,
-        init_and_floor_gas: &mut InitialAndFloorGas,
-    ) -> Result<u64, Self::Error> {
-        // This is revm's default `pre_execution` sequence. The trait has no hook after
-        // authorization processing, so these three calls are repeated here solely to place the
-        // reserve checkpoint at the transaction/execution boundary.
-        self.validate_against_state_and_deduct_caller(evm, init_and_floor_gas)?;
-        self.load_accounts(evm)?;
-        let eip7702_refund = self.apply_eip7702_auth_list(evm, init_and_floor_gas)?;
+        checkpoint: JournalCheckpoint,
+        gas: &mut GasTracker,
+    ) -> Result<Option<FrameResult>, Self::Error> {
+        let Some(first_frame_input) = self.first_frame_input(evm, gas)? else {
+            execution::runtime_oog_unwind(evm.ctx(), checkpoint)?;
+            return Ok(None)
+        };
+
+        // Authorization and EIP-2780 runtime state must survive a reserve rollback. Open the
+        // reserve checkpoint only after revm has completed and committed that phase.
+        evm.ctx().journal_mut().checkpoint_commit();
 
         debug_assert!(self.execution_checkpoint.get().is_none());
         self.execution_checkpoint.set(Some(evm.ctx().journal_mut().checkpoint()));
 
-        Ok(eip7702_refund)
+        let mut frame_result = self.run_exec_loop(evm, first_frame_input)?;
+        self.last_frame_result(evm, &mut frame_result, gas)?;
+        Ok(Some(frame_result))
     }
 
     fn post_execution(
@@ -269,7 +274,7 @@ where
         // EIP-7702 authorization refund may be reapplied to this snapshot.
         let execution_gas = *exec_result.gas();
 
-        self.refund(evm, exec_result, eip7702_gas_refund);
+        self.refund(evm, exec_result, eip7702_gas_refund)?;
         // Match revm's default lifecycle: capture the pre-floor gas components. `ResultGas`
         // applies the EIP-7623 floor when deriving `tx_gas_used`, while retaining the actual
         // pre-floor spend and refund for downstream consumers.
@@ -315,10 +320,10 @@ where
         init_and_floor_gas: InitialAndFloorGas,
         eip7702_gas_refund: i64,
     ) -> Result<Option<ResultGas>, ERROR> {
-        let execution_checkpoint = self
-            .execution_checkpoint
-            .take()
-            .expect("reserve checkpoint must be created before beneficiary processing");
+        // Pre-execution validation and EIP-2780 runtime setup can run out of gas before the
+        // reserve checkpoint exists. Revm still invokes post-execution for those outcomes, but
+        // there is no delegated execution state to inspect or roll back.
+        let Some(execution_checkpoint) = self.execution_checkpoint.take() else { return Ok(None) };
 
         // Revm invokes this hook after refund calculation, gas-floor enforcement, and caller
         // reimbursement. The inspected balance is therefore the real post-transaction balance.
@@ -337,7 +342,7 @@ where
             // authorization refund, then recompute both the normal refund cap and EIP-7623 floor
             // from the pre-refund execution gas. The first reimbursement was also reverted, so
             // apply it again using this synthetic top-level REVERT result.
-            self.refund(evm, exec_result, eip7702_gas_refund);
+            self.refund(evm, exec_result, eip7702_gas_refund)?;
             let result_gas = post_execution::build_result_gas(
                 exec_result.instruction_result().is_halt(),
                 exec_result.gas(),

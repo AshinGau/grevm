@@ -8,8 +8,11 @@ use revm_database::{
     states::{CacheAccount, bundle_state::BundleRetention, plain_account::PlainStorage},
 };
 use revm_primitives::{Address, B256, U256};
-use revm_state::{Account, AccountInfo, Bytecode, EvmState};
+use revm_state::{
+    Account, AccountInfo, Bytecode, EvmState, EvmStorage, EvmStorageSlot, TransactionId,
+};
 use std::{
+    borrow::Cow,
     fmt::Formatter,
     time::{Duration, Instant},
     vec::Vec,
@@ -18,6 +21,34 @@ use std::{
 #[inline]
 fn duration_micros(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000_000.0
+}
+
+fn add_transitions(
+    state: &mut TransitionState,
+    transitions: impl IntoIterator<Item = (Address, TransitionAccount)>,
+) {
+    state.add_transitions(transitions.into_iter().map(|(address, transition)| {
+        let transition = transition.map_storage(|storage| {
+            (!storage.is_empty()).then(|| {
+                Cow::Owned(
+                    storage
+                        .into_iter()
+                        .map(|(key, slot)| {
+                            (
+                                key,
+                                EvmStorageSlot::new_changed(
+                                    slot.original_value(),
+                                    slot.present_value(),
+                                    TransactionId::ZERO,
+                                ),
+                            )
+                        })
+                        .collect::<EvmStorage>(),
+                )
+            })
+        });
+        (address, transition)
+    }));
 }
 
 #[derive(Clone, Debug, Default)]
@@ -294,14 +325,12 @@ impl ParallelCacheState {
     /// Apply updated account state to the cached account.
     /// Returns account transition if applicable.
     fn apply_account_state(&self, address: Address, account: Account) -> Option<TransitionAccount> {
-        // not touched account are never changed.
         if !account.is_touched() {
             return None;
         }
         let is_created = account.is_created();
         let is_empty = account.is_empty();
         let is_destructed = account.is_selfdestructed();
-        // transform evm storage to storage with previous value.
         let changed_storage = account
             .storage
             .into_iter()
@@ -438,7 +467,6 @@ pub struct ParallelState<DB> {
     /// This map can be used to give different values for block hashes if in case
     /// The fork block is different or some blocks are not saved inside database.
     pub block_hashes: DashMap<u64, B256, BuildIdentityHasher>,
-
     update_db_metrics: bool,
     db_latency: metrics::Histogram,
 }
@@ -648,10 +676,10 @@ impl<DB: DatabaseRef> DatabaseRef for ParallelStateCommit<'_, DB> {
 }
 
 impl<DB: DatabaseRef> DatabaseCommit for ParallelStateCommit<'_, DB> {
-    fn commit(&mut self, evm_state: revm_primitives::AddressMap<Account>) {
+    fn commit(&mut self, evm_state: EvmState) {
         let transitions = self.shared.cache.apply_evm_state_inner(evm_state);
         if let Some(state) = self.transition_state.as_mut() {
-            state.add_transitions(transitions);
+            add_transitions(state, transitions);
         }
     }
 }
@@ -747,7 +775,6 @@ impl<DB: DatabaseRef> ParallelState<DB> {
         &mut self,
         addresses: impl IntoIterator<Item = Address>,
     ) -> Result<Vec<u128>, DB::Error> {
-        // make transition and update cache state
         let mut transitions = Vec::new();
         let mut balances = Vec::new();
         for address in addresses {
@@ -756,9 +783,8 @@ impl<DB: DatabaseRef> ParallelState<DB> {
             balances.push(balance);
             transitions.push((address, transition))
         }
-        // append transition
-        if let Some(s) = self.transition_state.as_mut() {
-            s.add_transitions(transitions)
+        if let Some(state) = self.transition_state.as_mut() {
+            add_transitions(state, transitions)
         }
         Ok(balances)
     }
@@ -785,9 +811,8 @@ impl<DB: DatabaseRef> ParallelState<DB> {
 
     /// Apply evm transitions to transition state.
     pub fn apply_transition(&mut self, transitions: Vec<(Address, TransitionAccount)>) {
-        // add transition to transition state.
-        if let Some(s) = self.transition_state.as_mut() {
-            s.add_transitions(transitions)
+        if let Some(state) = self.transition_state.as_mut() {
+            add_transitions(state, transitions)
         }
     }
 
@@ -881,9 +906,11 @@ impl<DB: DatabaseRef> DatabaseRef for ParallelState<DB> {
 }
 
 impl<DB: DatabaseRef> DatabaseCommit for ParallelState<DB> {
-    fn commit(&mut self, evm_state: revm_primitives::AddressMap<Account>) {
-        let transitions = self.cache.apply_evm_state(evm_state);
-        self.apply_transition(transitions);
+    fn commit(&mut self, evm_state: EvmState) {
+        let transitions = self.cache.apply_evm_state_inner(evm_state);
+        if let Some(state) = self.transition_state.as_mut() {
+            add_transitions(state, transitions);
+        }
     }
 }
 
